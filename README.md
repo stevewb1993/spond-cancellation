@@ -89,6 +89,32 @@ uv run python main.py
 
 The app runs at `http://localhost:5001`.
 
+## Database
+
+The app stores its transfer log in a database chosen by the `DATABASE_URL` env var:
+
+- **Unset** (local dev / tests) — a local SQLite file, `transfers.db`.
+- **Set** — Postgres (via `psycopg`), e.g. a hosted [Neon](https://neon.tech) database.
+
+The schema is created automatically on startup; no manual migration step is needed.
+
+## Deploying (free)
+
+Hosted free on **Render** (web service) + **Neon** (Postgres):
+
+1. Create a free Postgres database at <https://neon.tech> and copy its connection
+   string (the `postgresql://...?sslmode=require` URL).
+2. Push this repo to GitHub.
+3. On <https://render.com>, create a new Blueprint from the repo. `render.yaml`
+   provisions a free web service.
+4. In the Render dashboard, fill in the env vars marked `sync: false` —
+   especially `DATABASE_URL` (the Neon string), the `SPOND_*`, `ADMIN_PASSWORD`,
+   and `SMTP_*` values. `SECRET_KEY` is generated automatically.
+
+The free web service sleeps after ~15 minutes of inactivity and takes ~30–60s to
+wake on the next request — fine for low-traffic use. Neon's free tier is
+persistent, so the transfer log survives restarts.
+
 ## Pages
 
 - `/` — Enter email to receive a verification code

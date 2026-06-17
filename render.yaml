@@ -1,0 +1,35 @@
+# Render Blueprint — deploys the app as a free web service.
+# Create the database separately on Neon (https://neon.tech) and paste its
+# connection string into the DATABASE_URL env var in the Render dashboard.
+services:
+  - type: web
+    name: spond-session-transfer
+    runtime: python
+    plan: free
+    buildCommand: pip install uv && uv sync --frozen
+    # gunicorn binds to the port Render provides; the long timeout covers the
+    # slow Spond API lookups. init_db() runs automatically at import.
+    startCommand: uv run gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --timeout 120
+    envVars:
+      - key: DATABASE_URL
+        sync: false   # paste the Neon connection string here
+      - key: SECRET_KEY
+        generateValue: true
+      - key: SPOND_USERNAME
+        sync: false
+      - key: SPOND_PASSWORD
+        sync: false
+      - key: SPOND_CLUB_ID
+        sync: false
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: SMTP_HOST
+        value: smtp.gmail.com
+      - key: SMTP_PORT
+        value: "587"
+      - key: SMTP_USERNAME
+        sync: false
+      - key: SMTP_PASSWORD
+        sync: false
+      - key: SMTP_FROM
+        sync: false

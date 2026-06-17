@@ -26,6 +26,11 @@ SPOND_CLUB_ID = os.environ.get("SPOND_CLUB_ID", "")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin")
 DB_PATH = os.path.join(os.path.dirname(__file__), "transfers.db")
 
+# When DATABASE_URL is set (e.g. a hosted Postgres like Neon) we use Postgres;
+# otherwise we fall back to a local SQLite file, which is handy for dev and tests.
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+USE_POSTGRES = bool(DATABASE_URL)
+
 # --- Email / verification config ---
 SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
@@ -41,10 +46,32 @@ MAX_CODE_ATTEMPTS = 5
 # --- Database ---
 
 
+def _connect():
+    """Open a new connection to the active backend.
+
+    Both psycopg and sqlite3 connections expose the small slice of the DB-API
+    this app relies on: ``.execute(query, params)`` returning a cursor,
+    ``.commit()`` and ``.close()``. Rows come back keyed by column name in both
+    cases (``dict_row`` for psycopg, ``sqlite3.Row`` for SQLite).
+    """
+    if USE_POSTGRES:
+        import psycopg
+        from psycopg.rows import dict_row
+
+        return psycopg.connect(DATABASE_URL, row_factory=dict_row)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _q(query):
+    """Translate ?-style placeholders to the active driver's paramstyle."""
+    return query.replace("?", "%s") if USE_POSTGRES else query
+
+
 def get_db():
     if "db" not in g:
-        g.db = sqlite3.connect(DB_PATH)
-        g.db.row_factory = sqlite3.Row
+        g.db = _connect()
     return g.db
 
 
@@ -56,10 +83,16 @@ def close_db(exc):
 
 
 def init_db():
-    db = sqlite3.connect(DB_PATH)
-    db.execute("""
+    # SERIAL on Postgres, AUTOINCREMENT on SQLite; everything else is identical.
+    id_column = (
+        "id SERIAL PRIMARY KEY"
+        if USE_POSTGRES
+        else "id INTEGER PRIMARY KEY AUTOINCREMENT"
+    )
+    db = _connect()
+    db.execute(f"""
         CREATE TABLE IF NOT EXISTS transfer_requests (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            {id_column},
             member_name TEXT NOT NULL,
             member_email TEXT NOT NULL,
             cancelled_event_id TEXT NOT NULL,
@@ -600,11 +633,11 @@ def step_target():
 
             db = get_db()
             db.execute(
-                """INSERT INTO transfer_requests
+                _q("""INSERT INTO transfer_requests
                    (member_name, member_email, cancelled_event_id,
                     cancelled_event_name, target_event_id, target_event_name,
                     status, created_at, processed_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"""),
                 (
                     session.get("member_name", ""),
                     email,
@@ -669,6 +702,12 @@ def admin():
 def admin_logout():
     session.pop("admin", None)
     return redirect(url_for("admin"))
+
+
+# Under a WSGI server (gunicorn) the __main__ block below never runs, so make
+# sure the schema exists at import time when a real database is configured.
+if USE_POSTGRES:
+    init_db()
 
 
 if __name__ == "__main__":
