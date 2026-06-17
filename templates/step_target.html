@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block title %}Select New Session{% endblock %}
+{% block content %}
+<h1>Which session do you want to move to?</h1>
+<div class="card">
+    <p>Transferring from: <strong>{{ cancelled_label }}</strong></p>
+    <p>Showing sessions at {{ amount }}:</p>
+    <form method="POST">
+        {% for event in events %}
+        <label class="radio-option">
+            <input type="radio" name="target_event" value="{{ event.id }}" required>
+            {{ event.label }}
+        </label>
+        {% endfor %}
+        <button type="submit" class="btn btn-primary">Confirm Transfer</button>
+    </form>
+</div>
+<div class="nav" style="margin-top: 1rem;">
+    <a href="{{ url_for('step_cancelled') }}">&larr; Back</a>
+</div>
+{% endblock %}

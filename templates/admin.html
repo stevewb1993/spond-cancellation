@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block title %}Admin — Transfer Log{% endblock %}
+{% block content %}
+<div class="nav">
+    <a href="{{ url_for('admin_logout') }}">Logout</a>
+</div>
+
+<h1>Transfer Log</h1>
+
+{% if requests %}
+<div class="card">
+    {% for req in requests %}
+    <div class="request-row">
+        <div class="request-info">
+            <strong>{{ req.member_name }}</strong> ({{ req.member_email }})<br>
+            <small>{{ req.cancelled_event_name }} &rarr; {{ req.target_event_name }}</small><br>
+            <small>{{ req.created_at[:16] }}</small>
+        </div>
+        <span class="badge badge-{{ req.status }}">{{ req.status }}</span>
+    </div>
+    {% endfor %}
+</div>
+{% else %}
+<div class="card"><p>No transfers yet.</p></div>
+{% endif %}
+{% endblock %}
