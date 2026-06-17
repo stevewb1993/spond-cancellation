@@ -813,15 +813,26 @@ class TestAcceptWithoutPayment:
         s.clientsession.put = MagicMock(
             return_value=MockAsyncContextManager(resp)
         )
+        # The post-write check reads the event fresh via clientsession.get
+        # (bypassing the library cache), so tests configure that, not get_event.
+        s.clientsession.get = MagicMock()
         return s
+
+    def _set_fresh_event(self, s, event):
+        """Configure the post-check's cache-bypassing GET to return `event`."""
+        get_resp = MagicMock()
+        get_resp.json = AsyncMock(return_value=event)
+        s.clientsession.get = MagicMock(
+            return_value=MockAsyncContextManager(get_resp)
+        )
 
     @pytest.mark.asyncio
     async def test_succeeds_when_member_actually_accepted(self):
         from app import _accept_without_payment
 
         s = self._make_spond(put_status=200)
-        s.get_event = AsyncMock(
-            return_value=make_event(event_id="EVT2", accepted_ids=["MEM1"])
+        self._set_fresh_event(
+            s, make_event(event_id="EVT2", accepted_ids=["MEM1"])
         )
         result = await _accept_without_payment(s, "EVT2", "MEM1")
         assert "MEM1" in result["acceptedIds"]
@@ -837,11 +848,10 @@ class TestAcceptWithoutPayment:
 
         # e.g. the 402 payment-required response we used to swallow.
         s = self._make_spond(put_status=402, put_body='{"paymentIntent":"pi_x"}')
-        s.get_event = AsyncMock()
         with pytest.raises(ValueError, match="HTTP 402"):
             await _accept_without_payment(s, "EVT2", "MEM1")
         # Must not even bother verifying — it already failed hard.
-        s.get_event.assert_not_called()
+        s.clientsession.get.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_raises_when_200_but_not_actually_accepted(self):
@@ -849,8 +859,8 @@ class TestAcceptWithoutPayment:
 
         # 200, but the member never landed in acceptedIds.
         s = self._make_spond(put_status=200)
-        s.get_event = AsyncMock(
-            return_value=make_event(event_id="EVT2", unanswered_ids=["MEM1"])
+        self._set_fresh_event(
+            s, make_event(event_id="EVT2", unanswered_ids=["MEM1"])
         )
         with pytest.raises(ValueError, match="didn't take effect"):
             await _accept_without_payment(s, "EVT2", "MEM1")
@@ -862,7 +872,7 @@ class TestAcceptWithoutPayment:
         s = self._make_spond(put_status=200)
         event = make_event(event_id="EVT2")
         event["responses"]["waitinglistIds"] = ["MEM1"]
-        s.get_event = AsyncMock(return_value=event)
+        self._set_fresh_event(s, event)
         with pytest.raises(ValueError, match="waiting list"):
             await _accept_without_payment(s, "EVT2", "MEM1")
 

@@ -193,6 +193,21 @@ async def _get_transaction_detail(http_session, club_token, tx_id):
         return await r.json()
 
 
+async def _get_event_fresh(s, event_id):
+    """Fetch a single event straight from the API, bypassing the library cache.
+
+    ``Spond.get_event`` searches ``self.events``, which is populated once and
+    never refreshed — so a read right after a write returns the stale,
+    pre-write copy. The post-write check below must see the *current* state, so
+    we hit the single-event endpoint directly.
+    """
+    if not s.token:
+        await s.login()
+    url = f"{s.api_url}sponds/{event_id}"
+    async with s.clientsession.get(url, headers=s.auth_headers) as r:
+        return await r.json()
+
+
 async def _accept_without_payment(s, event_id, member_id):
     """Accept a member onto a paid event without charging them, and verify it.
 
@@ -221,8 +236,9 @@ async def _accept_without_payment(s, event_id, member_id):
                 "You have not been added. Please contact an admin."
             )
 
-    # A 200 alone isn't proof — confirm the change really took effect.
-    event = await s.get_event(event_id)
+    # A 200 alone isn't proof — confirm the change really took effect. Read
+    # fresh from the API, not the stale library cache populated pre-transfer.
+    event = await _get_event_fresh(s, event_id)
     responses = event.get("responses", {})
     if member_id in responses.get("acceptedIds", []):
         return responses
