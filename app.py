@@ -12,6 +12,12 @@ from dotenv import load_dotenv
 
 load_dotenv()
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+
+# Spond timestamps are UTC; club members read times in UK local time, so we
+# render in Europe/London (which tracks BST/GMT and the daylight-savings
+# switch automatically).
+UK_TZ = ZoneInfo("Europe/London")
 
 import aiohttp
 from flask import Flask, flash, g, redirect, render_template, request, session, url_for
@@ -142,6 +148,7 @@ def format_event_label(event):
     if start:
         try:
             dt = datetime.fromisoformat(start.replace("Z", "+00:00"))
+            dt = dt.astimezone(UK_TZ)
             return f"{name} — {dt.strftime('%a %d %b %Y, %H:%M')}"
         except (ValueError, TypeError):
             pass

@@ -204,11 +204,19 @@ def make_transaction(
 
 
 class TestFormatEventLabel:
-    def test_with_timestamp(self):
+    def test_with_timestamp_converts_utc_to_uk_summer_time(self):
+        # June is BST (UTC+1), so 07:00Z must display as 08:00 UK time.
         event = {"heading": "STV Swim", "startTimestamp": "2026-06-20T07:00:00Z"}
         label = format_event_label(event)
         assert "STV Swim" in label
         assert "20 Jun 2026" in label
+        assert "08:00" in label
+
+    def test_with_timestamp_winter_is_utc(self):
+        # January is GMT (UTC+0), so the displayed time matches the UTC time.
+        event = {"heading": "STV Swim", "startTimestamp": "2026-01-20T07:00:00Z"}
+        label = format_event_label(event)
+        assert "20 Jan 2026" in label
         assert "07:00" in label
 
     def test_without_timestamp(self):

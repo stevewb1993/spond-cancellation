@@ -721,6 +721,7 @@ dependencies = [
     { name = "psycopg", extra = ["binary"] },
     { name = "python-dotenv" },
     { name = "spond" },
+    { name = "tzdata" },
 ]
 
 [package.dev-dependencies]
@@ -736,6 +737,7 @@ requires-dist = [
     { name = "psycopg", extras = ["binary"], specifier = ">=3.2.0" },
     { name = "python-dotenv", specifier = ">=1.2.2" },
     { name = "spond", specifier = ">=1.2.1" },
+    { name = "tzdata", specifier = ">=2024.1" },
 ]
 
 [package.metadata.requires-dev]
