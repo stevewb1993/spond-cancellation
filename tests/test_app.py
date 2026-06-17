@@ -13,7 +13,35 @@ os.environ.setdefault("SPOND_CLUB_ID", "CLUB123")
 os.environ.setdefault("SECRET_KEY", "test-secret")
 os.environ.setdefault("ADMIN_PASSWORD", "admin")
 
-from app import app, format_event_label, init_db, _hash_code
+from app import (
+    app,
+    format_event_label,
+    get_db,
+    get_used_cancelled_event_ids,
+    init_db,
+    _hash_code,
+)
+
+
+def insert_transfer(
+    cancelled_event_id,
+    member_email="user@example.com",
+    status="approved",
+):
+    """Seed a row in the transfer log (used by the one-use-per-session tests)."""
+    with app.app_context():
+        db = get_db()
+        db.execute(
+            "INSERT INTO transfer_requests (member_name, member_email, "
+            "cancelled_event_id, cancelled_event_name, target_event_id, "
+            "target_event_name, status, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "Test User", member_email, cancelled_event_id, "Cancelled",
+                "TGT", "Target", status, "2026-06-17T00:00:00",
+            ),
+        )
+        db.commit()
 
 
 def login(client, **extra):
@@ -837,3 +865,49 @@ class TestAcceptWithoutPayment:
         s.get_event = AsyncMock(return_value=event)
         with pytest.raises(ValueError, match="waiting list"):
             await _accept_without_payment(s, "EVT2", "MEM1")
+
+
+class TestOneUsePerCancelledSession:
+    """A cancelled session may only fund a single transfer."""
+
+    def test_used_ids_only_counts_approved(self, client):
+        insert_transfer("EVT1", status="approved")
+        insert_transfer("EVT3", status="failed")
+        with app.app_context():
+            used = get_used_cancelled_event_ids("user@example.com")
+        assert used == {"EVT1"}
+
+    def test_used_ids_are_scoped_to_member(self, client):
+        insert_transfer("EVT1", member_email="other@example.com")
+        with app.app_context():
+            used = get_used_cancelled_event_ids("user@example.com")
+        assert used == set()
+
+    def test_cancelled_list_hides_spent_session(self, client):
+        insert_transfer("EVT1")  # already transferred from EVT1
+        login(client, cancelled_events=[
+            {"event_id": "EVT1", "label": "Monday Swim", "amount_paid": 350},
+            {"event_id": "EVT2", "label": "Tuesday Swim", "amount_paid": 350},
+        ])
+        resp = client.get("/cancelled")
+        assert b"Tuesday Swim" in resp.data
+        assert b"Monday Swim" not in resp.data
+
+    @patch("app.run_async")
+    def test_target_blocks_reused_session(self, mock_run, client):
+        insert_transfer("EVT1")  # EVT1 already spent
+        login(
+            client,
+            cancelled_event_id="EVT1",
+            cancelled_event_label="Monday Swim",
+            amount_paid=350,
+            target_events=[{"id": "EVT2", "label": "Wednesday Swim"}],
+        )
+        mock_run.return_value = ([], "Test User")  # step_cancelled reload only
+        resp = client.post(
+            "/target", data={"target_event": "EVT2"}, follow_redirects=True
+        )
+        assert b"already used" in resp.data
+        assert b"Done" not in resp.data
+        # The transfer itself must never run for a spent session.
+        assert mock_run.call_count <= 1

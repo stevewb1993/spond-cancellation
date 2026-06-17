@@ -108,6 +108,23 @@ def init_db():
     db.close()
 
 
+def get_used_cancelled_event_ids(member_email):
+    """Cancelled-event ids this member has already transferred *from*.
+
+    Each cancelled session funds exactly one transfer, so a successful
+    ('approved') transfer spends it — it can't be used to claim another.
+    """
+    db = get_db()
+    rows = db.execute(
+        _q(
+            "SELECT DISTINCT cancelled_event_id FROM transfer_requests "
+            "WHERE member_email = ? AND status = 'approved'"
+        ),
+        (member_email,),
+    ).fetchall()
+    return {row["cancelled_event_id"] for row in rows}
+
+
 # --- Spond helpers ---
 
 
@@ -625,7 +642,11 @@ def step_cancelled():
         session["cancelled_events"] = cancelled
         session["member_name"] = member_name
 
-    cancelled_events = session["cancelled_events"]
+    # A cancelled session can only fund one transfer — hide any already spent.
+    used = get_used_cancelled_event_ids(session["email"])
+    cancelled_events = [
+        e for e in session["cancelled_events"] if e["event_id"] not in used
+    ]
 
     if request.method == "POST":
         cancelled_id = request.form.get("cancelled_event")
@@ -677,6 +698,22 @@ def step_target():
         else:
             email = session["email"]
             cancelled_id = session["cancelled_event_id"]
+
+            # Re-check here too: the cancelled session must not already be
+            # spent (guards against stale sessions and double submits).
+            if cancelled_id in get_used_cancelled_event_ids(email):
+                for key in [
+                    "cancelled_events", "cancelled_event_id",
+                    "cancelled_event_label", "amount_paid", "target_events",
+                ]:
+                    session.pop(key, None)
+                flash(
+                    "You've already used that cancelled session to transfer to "
+                    "another session. Each cancelled session can only be used once.",
+                    "error",
+                )
+                return redirect(url_for("step_cancelled"))
+
             now = datetime.now(timezone.utc).isoformat()
             try:
                 run_async(_do_transfer(email, cancelled_id, target_id))
