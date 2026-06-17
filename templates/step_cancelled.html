@@ -3,6 +3,7 @@
 {% block content %}
 <h1>Which session did you cancel?</h1>
 <div class="card">
+    {% if events %}
     <p>We found the following paid sessions that you've cancelled:</p>
     <form method="POST">
         {% for event in events %}
@@ -13,8 +14,9 @@
         {% endfor %}
         <button type="submit" class="btn btn-primary">Next</button>
     </form>
-</div>
-<div class="nav" style="margin-top: 1rem;">
-    <a href="{{ url_for('step_email') }}">&larr; Back</a>
+    {% else %}
+    <p>We couldn't find any paid sessions that you've cancelled. Make sure
+       you've declined the session in Spond first, then check back here.</p>
+    {% endif %}
 </div>
 {% endblock %}

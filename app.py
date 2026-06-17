@@ -1,6 +1,12 @@
 import asyncio
+import hashlib
+import hmac
 import os
+import secrets
+import smtplib
 import sqlite3
+from email.message import EmailMessage
+from functools import wraps
 
 from dotenv import load_dotenv
 
@@ -19,6 +25,17 @@ SPOND_PASSWORD = os.environ.get("SPOND_PASSWORD", "")
 SPOND_CLUB_ID = os.environ.get("SPOND_CLUB_ID", "")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin")
 DB_PATH = os.path.join(os.path.dirname(__file__), "transfers.db")
+
+# --- Email / verification config ---
+SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
+SMTP_USERNAME = os.environ.get("SMTP_USERNAME", "")
+SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
+SMTP_FROM = os.environ.get("SMTP_FROM", SMTP_USERNAME)
+
+# How long a verification code stays valid, and how many guesses are allowed.
+CODE_TTL = timedelta(minutes=10)
+MAX_CODE_ATTEMPTS = 5
 
 
 # --- Database ---
@@ -329,47 +346,197 @@ async def _do_transfer(email, cancelled_event_id, target_event_id):
         await s.clientsession.close()
 
 
+async def _lookup_member(email):
+    """Return the member's full name if the email belongs to the club.
+
+    Raises KeyError if no club member matches the email. The Spond admin
+    account only has visibility of its own club's members, so a successful
+    lookup is what establishes club membership.
+    """
+    s = Spond(SPOND_USERNAME, SPOND_PASSWORD)
+    try:
+        person = await s.get_person(email)
+        return f"{person['firstName']} {person['lastName']}"
+    finally:
+        await s.clientsession.close()
+
+
+# --- Authentication ---
+
+
+def _hash_code(code):
+    """Salted hash of a verification code so the raw code never sits in the
+    session cookie."""
+    salted = f"{app.secret_key}:{code}".encode()
+    return hashlib.sha256(salted).hexdigest()
+
+
+def generate_code():
+    """A 6-digit numeric one-time code."""
+    return f"{secrets.randbelow(1_000_000):06d}"
+
+
+def send_verification_email(to_email, code):
+    """Email a one-time verification code via SMTP (Gmail by default)."""
+    msg = EmailMessage()
+    msg["Subject"] = "Your Bath Amphibians verification code"
+    msg["From"] = SMTP_FROM
+    msg["To"] = to_email
+    minutes = int(CODE_TTL.total_seconds() // 60)
+    msg.set_content(
+        f"Your Bath Amphibians session-transfer verification code is:\n\n"
+        f"    {code}\n\n"
+        f"It expires in {minutes} minutes. If you didn't request this, "
+        f"you can ignore this email."
+    )
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+        server.starttls()
+        server.login(SMTP_USERNAME, SMTP_PASSWORD)
+        server.send_message(msg)
+
+
+def _clear_pending():
+    """Drop the in-progress verification state from the session."""
+    for key in (
+        "pending_email", "pending_name", "code_hash",
+        "code_expires", "code_attempts",
+    ):
+        session.pop(key, None)
+
+
+def login_required(view):
+    """Guard a view so only members who've verified their email can reach it."""
+
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        if not session.get("authenticated") or not session.get("email"):
+            flash("Please verify your email to continue.", "error")
+            return redirect(url_for("step_email"))
+        return view(*args, **kwargs)
+
+    return wrapped
+
+
 # --- Routes ---
 
 
 @app.route("/", methods=["GET", "POST"])
 def step_email():
+    # Already-verified members skip straight to their sessions.
+    if session.get("authenticated") and session.get("email"):
+        return redirect(url_for("step_cancelled"))
+
     if request.method == "POST":
         email = request.form.get("member_email", "").strip()
         if not email:
             flash("Please enter your email.", "error")
-        else:
+            return render_template("step_email.html")
+
+        # Requirement 1: only people in the club can get in. The Spond admin
+        # account only sees its own club's members, so a failed lookup means
+        # they're not a member.
+        try:
+            member_name = run_async(_lookup_member(email))
+        except KeyError:
+            flash(
+                "We couldn't find that email in the club. "
+                "Make sure you're using the email registered with your Spond account.",
+                "error",
+            )
+            return render_template("step_email.html")
+
+        # Requirement 2: prove they own the email before acting on their
+        # behalf, by emailing a one-time code to that address.
+        code = generate_code()
+        try:
+            send_verification_email(email, code)
+        except Exception:
+            flash(
+                "We couldn't send a verification email right now. "
+                "Please try again shortly, or contact an admin.",
+                "error",
+            )
+            return render_template("step_email.html")
+
+        session.pop("authenticated", None)
+        session["pending_email"] = email
+        session["pending_name"] = member_name
+        session["code_hash"] = _hash_code(code)
+        session["code_expires"] = (
+            datetime.now(timezone.utc) + CODE_TTL
+        ).isoformat()
+        session["code_attempts"] = 0
+        flash(f"We've emailed a 6-digit verification code to {email}.", "success")
+        return redirect(url_for("step_verify"))
+
+    return render_template("step_email.html")
+
+
+@app.route("/verify", methods=["GET", "POST"])
+def step_verify():
+    if "pending_email" not in session:
+        return redirect(url_for("step_email"))
+
+    if request.method == "POST":
+        expires = datetime.fromisoformat(session["code_expires"])
+        if datetime.now(timezone.utc) > expires:
+            _clear_pending()
+            flash("That code has expired. Please request a new one.", "error")
+            return redirect(url_for("step_email"))
+
+        if session.get("code_attempts", 0) >= MAX_CODE_ATTEMPTS:
+            _clear_pending()
+            flash(
+                "Too many incorrect attempts. Please request a new code.",
+                "error",
+            )
+            return redirect(url_for("step_email"))
+
+        entered = request.form.get("code", "").strip()
+        if hmac.compare_digest(_hash_code(entered), session.get("code_hash", "")):
+            email = session["pending_email"]
+            member_name = session.get("pending_name", "")
+            _clear_pending()
+            session["authenticated"] = True
+            session["email"] = email
+
             try:
                 cancelled, member_name = run_async(
                     _find_cancelled_paid_events(email)
                 )
             except KeyError:
-                flash(
-                    "We couldn't find that email in Spond. "
-                    "Make sure you're using the email registered with your account.",
-                    "error",
-                )
-                return render_template("step_email.html")
-
+                cancelled = []
+            session["member_name"] = member_name
+            session["cancelled_events"] = cancelled
             if not cancelled:
                 flash(
-                    "We couldn't find any paid sessions that you've cancelled. "
-                    "Make sure you've declined the session in Spond first.",
+                    "You're verified, but we couldn't find any paid sessions "
+                    "you've cancelled. Make sure you've declined the session "
+                    "in Spond first.",
                     "error",
                 )
-            else:
-                session["email"] = email
-                session["member_name"] = member_name
-                session["cancelled_events"] = cancelled
-                return redirect(url_for("step_cancelled"))
+            return redirect(url_for("step_cancelled"))
 
-    return render_template("step_email.html")
+        session["code_attempts"] = session.get("code_attempts", 0) + 1
+        flash("That code wasn't correct. Please try again.", "error")
+
+    return render_template("step_verify.html", email=session["pending_email"])
 
 
 @app.route("/cancelled", methods=["GET", "POST"])
+@login_required
 def step_cancelled():
-    if "email" not in session or "cancelled_events" not in session:
-        return redirect(url_for("step_email"))
+    # Reload the member's cancelled sessions if they're not in the session
+    # (e.g. after a completed transfer or a direct visit).
+    if "cancelled_events" not in session:
+        try:
+            cancelled, member_name = run_async(
+                _find_cancelled_paid_events(session["email"])
+            )
+        except KeyError:
+            cancelled, member_name = [], session.get("member_name", "")
+        session["cancelled_events"] = cancelled
+        session["member_name"] = member_name
 
     cancelled_events = session["cancelled_events"]
 
@@ -405,10 +572,11 @@ def step_cancelled():
 
 
 @app.route("/target", methods=["GET", "POST"])
+@login_required
 def step_target():
-    required = ["email", "cancelled_event_id", "target_events"]
+    required = ["cancelled_event_id", "target_events"]
     if not all(k in session for k in required):
-        return redirect(url_for("step_email"))
+        return redirect(url_for("step_cancelled"))
 
     target_events = session["target_events"]
 
@@ -458,15 +626,16 @@ def step_target():
             )
             db.commit()
 
-            # Clear session state
+            # Clear the in-progress selection but keep the member logged in
+            # (and drop cancelled_events so it reloads fresh for another go).
             for key in [
-                "email", "member_name", "cancelled_events",
+                "cancelled_events",
                 "cancelled_event_id", "cancelled_event_label",
                 "amount_paid", "target_events",
             ]:
                 session.pop(key, None)
 
-            return redirect(url_for("step_email"))
+            return redirect(url_for("step_cancelled"))
 
     return render_template(
         "step_target.html",
@@ -474,6 +643,13 @@ def step_target():
         cancelled_label=session.get("cancelled_event_label", ""),
         amount=f"£{session.get('amount_paid', 0) / 100:.2f}",
     )
+
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    flash("You've been logged out.", "success")
+    return redirect(url_for("step_email"))
 
 
 @app.route("/admin", methods=["GET", "POST"])

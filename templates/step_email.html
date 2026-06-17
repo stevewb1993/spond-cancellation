@@ -3,12 +3,13 @@
 {% block content %}
 <h1>Request Session Transfer</h1>
 <div class="card">
-    <p>Cancelled a session? Enter your email to get started.</p>
+    <p>Cancelled a session? Enter the email registered with your Bath
+       Amphibians Spond account and we'll send you a verification code.</p>
     <form method="POST">
         <label for="member_email">Your Email</label>
         <input type="email" id="member_email" name="member_email" required
                placeholder="As registered in Spond">
-        <button type="submit" class="btn btn-primary">Next</button>
+        <button type="submit" class="btn btn-primary">Send code</button>
     </form>
 </div>
 {% endblock %}

@@ -13,7 +13,27 @@ os.environ.setdefault("SPOND_CLUB_ID", "CLUB123")
 os.environ.setdefault("SECRET_KEY", "test-secret")
 os.environ.setdefault("ADMIN_PASSWORD", "admin")
 
-from app import app, format_event_label, init_db
+from app import app, format_event_label, init_db, _hash_code
+
+
+def login(client, **extra):
+    """Mark the test client as a verified, logged-in member."""
+    with client.session_transaction() as sess:
+        sess["authenticated"] = True
+        sess["email"] = "user@example.com"
+        sess["member_name"] = "Test User"
+        sess.update(extra)
+
+
+def set_pending_code(client, code="123456", expired=False):
+    """Put a pending verification code into the session."""
+    delta = timedelta(minutes=-1) if expired else timedelta(minutes=10)
+    with client.session_transaction() as sess:
+        sess["pending_email"] = "user@example.com"
+        sess["pending_name"] = "Test User"
+        sess["code_hash"] = _hash_code(code)
+        sess["code_expires"] = (datetime.now(timezone.utc) + delta).isoformat()
+        sess["code_attempts"] = 0
 
 
 # --- Helpers ---
@@ -181,50 +201,100 @@ class TestStepEmail:
         assert resp.status_code == 200
         assert b"member_email" in resp.data
 
+    @patch("app.send_verification_email")
     @patch("app.run_async")
-    def test_post_with_cancelled_events_redirects(self, mock_run, client):
-        cancelled = [
-            {"event_id": "EVT1", "label": "STV Swim — Fri 20 Jun", "amount_paid": 350}
-        ]
-        mock_run.return_value = (cancelled, "Test User")
+    def test_post_member_sends_code_and_redirects(
+        self, mock_run, mock_send, client
+    ):
+        mock_run.return_value = "Test User"  # _lookup_member
         resp = client.post("/", data={"member_email": "user@example.com"})
         assert resp.status_code == 302
-        assert "/cancelled" in resp.headers["Location"]
+        assert "/verify" in resp.headers["Location"]
+        mock_send.assert_called_once()
 
+    @patch("app.send_verification_email")
     @patch("app.run_async")
-    def test_post_no_cancelled_events_shows_error(self, mock_run, client):
-        mock_run.return_value = ([], "Test User")
-        resp = client.post(
-            "/", data={"member_email": "user@example.com"}, follow_redirects=True
-        )
-        assert b"couldn" in resp.data
-
-    @patch("app.run_async")
-    def test_post_unknown_email_shows_error(self, mock_run, client):
+    def test_post_unknown_email_shows_error(self, mock_run, mock_send, client):
         mock_run.side_effect = KeyError("No person matched")
         resp = client.post(
             "/", data={"member_email": "nobody@example.com"}, follow_redirects=True
         )
         assert b"couldn" in resp.data
+        mock_send.assert_not_called()
+
+    @patch("app.send_verification_email")
+    @patch("app.run_async")
+    def test_post_email_send_failure_shows_error(
+        self, mock_run, mock_send, client
+    ):
+        mock_run.return_value = "Test User"
+        mock_send.side_effect = Exception("smtp down")
+        resp = client.post(
+            "/", data={"member_email": "user@example.com"}, follow_redirects=True
+        )
+        assert b"couldn" in resp.data.lower()
 
     def test_post_empty_email_shows_error(self, client):
         resp = client.post("/", data={"member_email": ""}, follow_redirects=True)
         assert b"enter your email" in resp.data.lower()
 
-
-class TestStepCancelled:
-    def test_redirects_without_session(self, client):
-        resp = client.get("/cancelled")
+    @patch("app.send_verification_email")
+    @patch("app.run_async")
+    def test_authenticated_member_skips_to_cancelled(
+        self, mock_run, mock_send, client
+    ):
+        login(client)
+        resp = client.get("/")
         assert resp.status_code == 302
+        assert "/cancelled" in resp.headers["Location"]
+
+
+class TestVerify:
+    def test_redirects_without_pending(self, client):
+        resp = client.get("/verify")
+        assert resp.status_code == 302
+        assert "/" == resp.headers["Location"] or resp.headers["Location"].endswith("/")
 
     @patch("app.run_async")
-    def test_shows_cancelled_events(self, mock_run, client):
+    def test_correct_code_authenticates(self, mock_run, client):
+        set_pending_code(client, code="123456")
         cancelled = [
             {"event_id": "EVT1", "label": "STV Swim — Fri 20 Jun", "amount_paid": 350}
         ]
         mock_run.return_value = (cancelled, "Test User")
-        client.post("/", data={"member_email": "user@example.com"})
+        resp = client.post("/verify", data={"code": "123456"})
+        assert resp.status_code == 302
+        assert "/cancelled" in resp.headers["Location"]
+        with client.session_transaction() as sess:
+            assert sess["authenticated"] is True
+            assert sess["email"] == "user@example.com"
 
+    def test_wrong_code_shows_error(self, client):
+        set_pending_code(client, code="123456")
+        resp = client.post(
+            "/verify", data={"code": "000000"}, follow_redirects=True
+        )
+        assert b"wasn" in resp.data.lower() or b"correct" in resp.data.lower()
+
+    def test_expired_code_redirects(self, client):
+        set_pending_code(client, code="123456", expired=True)
+        resp = client.post(
+            "/verify", data={"code": "123456"}, follow_redirects=True
+        )
+        assert b"expired" in resp.data.lower()
+
+
+class TestStepCancelled:
+    def test_redirects_without_auth(self, client):
+        resp = client.get("/cancelled")
+        assert resp.status_code == 302
+        assert resp.headers["Location"].endswith("/")
+
+    def test_shows_cancelled_events(self, client):
+        cancelled = [
+            {"event_id": "EVT1", "label": "STV Swim — Fri 20 Jun", "amount_paid": 350}
+        ]
+        login(client, cancelled_events=cancelled)
         resp = client.get("/cancelled")
         assert resp.status_code == 200
         assert b"STV Swim" in resp.data
@@ -234,8 +304,7 @@ class TestStepCancelled:
         cancelled = [
             {"event_id": "EVT1", "label": "STV Swim — Fri 20 Jun", "amount_paid": 350}
         ]
-        mock_run.return_value = (cancelled, "Test User")
-        client.post("/", data={"member_email": "user@example.com"})
+        login(client, cancelled_events=cancelled)
 
         targets = [{"id": "EVT2", "label": "STV Swim — Mon 23 Jun"}]
         mock_run.return_value = targets
@@ -248,8 +317,7 @@ class TestStepCancelled:
         cancelled = [
             {"event_id": "EVT1", "label": "STV Swim — Fri 20 Jun", "amount_paid": 350}
         ]
-        mock_run.return_value = (cancelled, "Test User")
-        client.post("/", data={"member_email": "user@example.com"})
+        login(client, cancelled_events=cancelled)
 
         mock_run.return_value = []
         resp = client.post(
@@ -261,23 +329,24 @@ class TestStepCancelled:
 
 
 class TestStepTarget:
-    def test_redirects_without_session(self, client):
+    def test_redirects_without_auth(self, client):
         resp = client.get("/target")
         assert resp.status_code == 302
+        assert resp.headers["Location"].endswith("/")
 
     @patch("app.run_async")
     def test_successful_transfer(self, mock_run, client):
-        cancelled = [
-            {"event_id": "EVT1", "label": "STV Swim — Fri 20 Jun", "amount_paid": 350}
+        login(
+            client,
+            cancelled_event_id="EVT1",
+            cancelled_event_label="STV Swim — Fri 20 Jun",
+            amount_paid=350,
+            target_events=[{"id": "EVT2", "label": "STV Swim — Mon 23 Jun"}],
+        )
+        mock_run.side_effect = [
+            {"acceptedIds": ["MEM1"]},  # _do_transfer
+            ([], "Test User"),          # reload in step_cancelled after redirect
         ]
-        mock_run.return_value = (cancelled, "Test User")
-        client.post("/", data={"member_email": "user@example.com"})
-
-        targets = [{"id": "EVT2", "label": "STV Swim — Mon 23 Jun"}]
-        mock_run.return_value = targets
-        client.post("/cancelled", data={"cancelled_event": "EVT1"})
-
-        mock_run.return_value = {"acceptedIds": ["MEM1"]}
         resp = client.post(
             "/target",
             data={"target_event": "EVT2"},
@@ -287,17 +356,17 @@ class TestStepTarget:
 
     @patch("app.run_async")
     def test_failed_transfer_shows_error(self, mock_run, client):
-        cancelled = [
-            {"event_id": "EVT1", "label": "STV Swim — Fri 20 Jun", "amount_paid": 350}
+        login(
+            client,
+            cancelled_event_id="EVT1",
+            cancelled_event_label="STV Swim — Fri 20 Jun",
+            amount_paid=350,
+            target_events=[{"id": "EVT2", "label": "STV Swim — Mon 23 Jun"}],
+        )
+        mock_run.side_effect = [
+            ValueError("Payment not found"),  # _do_transfer raises
+            ([], "Test User"),                # reload in step_cancelled after redirect
         ]
-        mock_run.return_value = (cancelled, "Test User")
-        client.post("/", data={"member_email": "user@example.com"})
-
-        targets = [{"id": "EVT2", "label": "STV Swim — Mon 23 Jun"}]
-        mock_run.return_value = targets
-        client.post("/cancelled", data={"cancelled_event": "EVT1"})
-
-        mock_run.side_effect = ValueError("Payment not found")
         resp = client.post(
             "/target",
             data={"target_event": "EVT2"},

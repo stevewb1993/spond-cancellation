@@ -103,6 +103,12 @@
 </head>
 <body>
     <div class="container">
+        {% if session.authenticated and session.email %}
+        <div class="nav" style="display: flex; justify-content: space-between;">
+            <span>Signed in as <strong>{{ session.member_name or session.email }}</strong></span>
+            <a href="{{ url_for('logout') }}">Log out</a>
+        </div>
+        {% endif %}
         {% with messages = get_flashed_messages(with_categories=true) %}
         {% for category, message in messages %}
         <div class="flash flash-{{ category }}">{{ message }}</div>
