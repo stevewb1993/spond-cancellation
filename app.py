@@ -177,12 +177,17 @@ async def _get_transaction_detail(http_session, club_token, tx_id):
 
 
 async def _accept_without_payment(s, event_id, member_id):
-    """Accept a member onto a paid event without charging them.
+    """Accept a member onto a paid event without charging them, and verify it.
 
     The library's change_response can't set custom headers. The organizer
     web app bypasses the Stripe payment flow by sending the
     `X-Spond-SkipPayment: true` header (the plain accept now returns an
     HTTP 402 payment intent without it).
+
+    Crucially, this never trusts the write blindly. It checks the HTTP status
+    and then re-reads the event to confirm the member actually landed in
+    acceptedIds, so a silently-rejected transfer is reported as a failure
+    rather than a false success.
     """
     if not s.token:
         await s.login()
@@ -191,13 +196,33 @@ async def _accept_without_payment(s, event_id, member_id):
     async with s.clientsession.put(
         url, headers=headers, json={"accepted": True}
     ) as r:
+        body = await r.text()
         if r.status != 200:
-            body = await r.text()
+            print(f"[transfer] accept rejected: HTTP {r.status} body={body[:300]}")
             raise ValueError(
                 f"Spond rejected the transfer (HTTP {r.status}). "
-                "Please contact an admin."
+                "You have not been added. Please contact an admin."
             )
-        return await r.json()
+
+    # A 200 alone isn't proof — confirm the change really took effect.
+    event = await s.get_event(event_id)
+    responses = event.get("responses", {})
+    if member_id in responses.get("acceptedIds", []):
+        return responses
+    if member_id in responses.get("waitinglistIds", []):
+        raise ValueError(
+            "That session looks full — you've been put on the waiting list "
+            "rather than confirmed. Please contact an admin."
+        )
+    counts = {k: len(v) for k, v in responses.items() if isinstance(v, list)}
+    print(
+        f"[transfer] post-check failed: {member_id} not in acceptedIds for "
+        f"{event_id}; response buckets={counts}"
+    )
+    raise ValueError(
+        "The transfer didn't take effect in Spond — you have not been added. "
+        "Please contact an admin."
+    )
 
 
 async def _find_cancelled_paid_events(email):
@@ -660,10 +685,19 @@ def step_target():
                     f"Done! You've been added to {selected['label']}.",
                     "success",
                 )
-            except Exception as e:
+            except ValueError as e:
+                # Expected, user-actionable failures carry a friendly message
+                # (declined check, price mismatch, transfer didn't take, etc.).
                 status = "failed"
+                flash(f"Couldn't complete the transfer: {e}", "error")
+            except Exception:
+                # Anything unexpected: log it for debugging, but never imply
+                # to the member that the transfer succeeded.
+                status = "failed"
+                app.logger.exception("Unexpected error during transfer")
                 flash(
-                    f"Something went wrong: {e}. Please contact an admin.",
+                    "Something went wrong while processing your transfer and "
+                    "you have not been added. Please contact an admin.",
                     "error",
                 )
 

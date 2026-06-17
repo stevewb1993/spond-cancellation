@@ -363,7 +363,7 @@ class TestStepTarget:
         assert b"Done" in resp.data or b"added" in resp.data.lower()
 
     @patch("app.run_async")
-    def test_failed_transfer_shows_error(self, mock_run, client):
+    def test_failed_transfer_shows_friendly_error(self, mock_run, client):
         login(
             client,
             cancelled_event_id="EVT1",
@@ -372,7 +372,7 @@ class TestStepTarget:
             target_events=[{"id": "EVT2", "label": "STV Swim — Mon 23 Jun"}],
         )
         mock_run.side_effect = [
-            ValueError("Payment not found"),  # _do_transfer raises
+            ValueError("Payment not found"),  # _do_transfer raises (expected)
             ([], "Test User"),                # reload in step_cancelled after redirect
         ]
         resp = client.post(
@@ -380,7 +380,34 @@ class TestStepTarget:
             data={"target_event": "EVT2"},
             follow_redirects=True,
         )
-        assert b"Something went wrong" in resp.data
+        # The friendly message is shown, and we never imply success.
+        # (Jinja HTML-escapes the apostrophe in "Couldn't", so match the rest.)
+        assert b"complete the transfer" in resp.data
+        assert b"Payment not found" in resp.data
+        assert b"Done" not in resp.data
+
+    @patch("app.run_async")
+    def test_unexpected_error_does_not_imply_success(self, mock_run, client):
+        login(
+            client,
+            cancelled_event_id="EVT1",
+            cancelled_event_label="STV Swim — Fri 20 Jun",
+            amount_paid=350,
+            target_events=[{"id": "EVT2", "label": "STV Swim — Mon 23 Jun"}],
+        )
+        mock_run.side_effect = [
+            RuntimeError("kaboom"),  # _do_transfer blows up unexpectedly
+            ([], "Test User"),       # reload in step_cancelled after redirect
+        ]
+        resp = client.post(
+            "/target",
+            data={"target_event": "EVT2"},
+            follow_redirects=True,
+        )
+        # Generic message, no leak of internals, no false "added" claim.
+        assert b"you have not been added" in resp.data
+        assert b"kaboom" not in resp.data
+        assert b"Done" not in resp.data
 
 
 class TestAdmin:
@@ -743,50 +770,70 @@ class TestDoTransfer:
 
 
 class TestAcceptWithoutPayment:
-    @pytest.mark.asyncio
-    async def test_sends_skip_payment_header(self):
-        from app import _accept_without_payment
+    """The transfer must only be treated as successful if Spond actually
+    adds the member — never trust the HTTP call blindly."""
 
+    def _make_spond(self, put_status=200, put_body="{}"):
         s = MagicMock()
-        s.token = "tok"
+        s.token = "tok"  # truthy -> skips login
         s.api_url = "https://api.spond.com/core/v1/"
         s.auth_headers = {"Authorization": "Bearer tok"}
-
-        captured = {}
-
-        def fake_put(url, headers=None, json=None):
-            captured["url"] = url
-            captured["headers"] = headers
-            captured["json"] = json
-            return MockAsyncContextManager(
-                make_mock_response({"acceptedIds": ["MEM1"]}, status=200)
-            )
-
-        s.clientsession = MagicMock()
-        s.clientsession.put = fake_put
-
-        result = await _accept_without_payment(s, "EVT2", "MEM1")
-
-        assert result == {"acceptedIds": ["MEM1"]}
-        assert captured["headers"]["X-Spond-SkipPayment"] == "true"
-        assert captured["json"] == {"accepted": True}
-        assert "sponds/EVT2/responses/MEM1" in captured["url"]
-
-    @pytest.mark.asyncio
-    async def test_raises_on_payment_required(self):
-        from app import _accept_without_payment
-
-        s = MagicMock()
-        s.token = "tok"
-        s.api_url = "https://api.spond.com/core/v1/"
-        s.auth_headers = {"Authorization": "Bearer tok"}
-
-        resp = make_mock_response({"paymentIntent": "pi_x"}, status=402)
-        resp.text = AsyncMock(return_value='{"paymentIntent": "pi_x"}')
+        resp = MagicMock()
+        resp.status = put_status
+        resp.text = AsyncMock(return_value=put_body)
         s.clientsession = MagicMock()
         s.clientsession.put = MagicMock(
             return_value=MockAsyncContextManager(resp)
         )
+        return s
 
+    @pytest.mark.asyncio
+    async def test_succeeds_when_member_actually_accepted(self):
+        from app import _accept_without_payment
+
+        s = self._make_spond(put_status=200)
+        s.get_event = AsyncMock(
+            return_value=make_event(event_id="EVT2", accepted_ids=["MEM1"])
+        )
+        result = await _accept_without_payment(s, "EVT2", "MEM1")
+        assert "MEM1" in result["acceptedIds"]
+        # It must PUT the accept, with the payment-skip header, to the right URL.
+        call = s.clientsession.put.call_args
+        assert "sponds/EVT2/responses/MEM1" in call.args[0]
+        assert call.kwargs["headers"]["X-Spond-SkipPayment"] == "true"
+        assert call.kwargs["json"] == {"accepted": True}
+
+    @pytest.mark.asyncio
+    async def test_raises_on_non_200(self):
+        from app import _accept_without_payment
+
+        # e.g. the 402 payment-required response we used to swallow.
+        s = self._make_spond(put_status=402, put_body='{"paymentIntent":"pi_x"}')
+        s.get_event = AsyncMock()
         with pytest.raises(ValueError, match="HTTP 402"):
+            await _accept_without_payment(s, "EVT2", "MEM1")
+        # Must not even bother verifying — it already failed hard.
+        s.get_event.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_raises_when_200_but_not_actually_accepted(self):
+        from app import _accept_without_payment
+
+        # 200, but the member never landed in acceptedIds.
+        s = self._make_spond(put_status=200)
+        s.get_event = AsyncMock(
+            return_value=make_event(event_id="EVT2", unanswered_ids=["MEM1"])
+        )
+        with pytest.raises(ValueError, match="didn't take effect"):
+            await _accept_without_payment(s, "EVT2", "MEM1")
+
+    @pytest.mark.asyncio
+    async def test_raises_when_waitlisted(self):
+        from app import _accept_without_payment
+
+        s = self._make_spond(put_status=200)
+        event = make_event(event_id="EVT2")
+        event["responses"]["waitinglistIds"] = ["MEM1"]
+        s.get_event = AsyncMock(return_value=event)
+        with pytest.raises(ValueError, match="waiting list"):
             await _accept_without_payment(s, "EVT2", "MEM1")
