@@ -359,15 +359,17 @@ async def _get_matching_events(amount):
             max_start=now + timedelta(days=7),
             max_events=50,
         )
-        results = []
-        for event in events or []:
-            price = event.get("payment", {}).get("total")
-            if price == amount:
-                results.append({
-                    "id": event["id"],
-                    "label": format_event_label(event),
-                })
-        return results
+        matching = [
+            event
+            for event in events or []
+            if event.get("payment", {}).get("total") == amount
+        ]
+        # Show the soonest sessions first.
+        matching.sort(key=lambda e: e.get("startTimestamp", ""))
+        return [
+            {"id": event["id"], "label": format_event_label(event)}
+            for event in matching
+        ]
     finally:
         await s.clientsession.close()
 
