@@ -57,15 +57,15 @@ cp .env.example .env
 | `SMTP_PASSWORD` | Gmail **App Password** (16 chars, requires 2FA) — not your normal password |
 | `SMTP_FROM` | From address on the emails (defaults to `SMTP_USERNAME`) |
 
-### Setting up the Gmail sender
+### Setting up email (Brevo)
 
-Verification codes are sent from a Gmail account using an **App Password**:
+Verification codes are sent via the [Brevo](https://www.brevo.com) HTTPS API.
+SMTP isn't used because many hosts (including Render) block outbound SMTP ports.
 
-1. Enable 2-Step Verification on the Gmail account.
-2. Go to <https://myaccount.google.com/apppasswords> and create an App Password.
-3. Put the 16-character password (spaces removed) in `SMTP_PASSWORD`.
-
-Gmail's free sending limit (~500/day) is far more than this app needs.
+1. Create a free Brevo account (300 emails/day free — far more than this needs).
+2. Verify a **sender** address (Senders & IPs → Senders). A Gmail address works
+   and needs no DNS changes. Put it in `EMAIL_FROM`.
+3. Create an API key (SMTP & API → API Keys) and put it in `BREVO_API_KEY`.
 
 ### Finding your Club ID
 

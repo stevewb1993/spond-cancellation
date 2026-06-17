@@ -1,11 +1,11 @@
 import asyncio
 import hashlib
 import hmac
+import json
 import os
 import secrets
-import smtplib
 import sqlite3
-from email.message import EmailMessage
+import urllib.request
 from functools import wraps
 
 from dotenv import load_dotenv
@@ -32,11 +32,11 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "")
 USE_POSTGRES = bool(DATABASE_URL)
 
 # --- Email / verification config ---
-SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.gmail.com")
-SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
-SMTP_USERNAME = os.environ.get("SMTP_USERNAME", "")
-SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
-SMTP_FROM = os.environ.get("SMTP_FROM", SMTP_USERNAME)
+# Verification codes are sent via Brevo's HTTPS API rather than SMTP, because
+# hosts like Render block outbound SMTP ports.
+BREVO_API_KEY = os.environ.get("BREVO_API_KEY", "")
+EMAIL_FROM = os.environ.get("EMAIL_FROM", "")
+EMAIL_FROM_NAME = os.environ.get("EMAIL_FROM_NAME", "Bath Amphibians")
 
 # How long a verification code stays valid, and how many guesses are allowed.
 CODE_TTL = timedelta(minutes=10)
@@ -410,22 +410,36 @@ def generate_code():
 
 
 def send_verification_email(to_email, code):
-    """Email a one-time verification code via SMTP (Gmail by default)."""
-    msg = EmailMessage()
-    msg["Subject"] = "Your Bath Amphibians verification code"
-    msg["From"] = SMTP_FROM
-    msg["To"] = to_email
+    """Email a one-time verification code via the Brevo HTTPS API.
+
+    Uses HTTPS (port 443) rather than SMTP so it works on hosts that block
+    outbound SMTP. Raises on a network error or non-2xx response, which the
+    caller turns into a friendly "couldn't send" message.
+    """
     minutes = int(CODE_TTL.total_seconds() // 60)
-    msg.set_content(
-        f"Your Bath Amphibians session-transfer verification code is:\n\n"
-        f"    {code}\n\n"
-        f"It expires in {minutes} minutes. If you didn't request this, "
-        f"you can ignore this email."
+    payload = {
+        "sender": {"email": EMAIL_FROM, "name": EMAIL_FROM_NAME},
+        "to": [{"email": to_email}],
+        "subject": "Your Bath Amphibians verification code",
+        "textContent": (
+            f"Your Bath Amphibians session-transfer verification code is:\n\n"
+            f"    {code}\n\n"
+            f"It expires in {minutes} minutes. If you didn't request this, "
+            f"you can ignore this email."
+        ),
+    }
+    req = urllib.request.Request(
+        "https://api.brevo.com/v3/smtp/email",
+        data=json.dumps(payload).encode(),
+        headers={
+            "api-key": BREVO_API_KEY,
+            "content-type": "application/json",
+            "accept": "application/json",
+        },
+        method="POST",
     )
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
-        server.starttls()
-        server.login(SMTP_USERNAME, SMTP_PASSWORD)
-        server.send_message(msg)
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        resp.read()
 
 
 def _clear_pending():

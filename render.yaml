@@ -23,13 +23,10 @@ services:
         sync: false
       - key: ADMIN_PASSWORD
         sync: false
-      - key: SMTP_HOST
-        value: smtp.gmail.com
-      - key: SMTP_PORT
-        value: "587"
-      - key: SMTP_USERNAME
+      # Email is sent via the Brevo HTTPS API (Render blocks outbound SMTP).
+      - key: BREVO_API_KEY
         sync: false
-      - key: SMTP_PASSWORD
-        sync: false
-      - key: SMTP_FROM
-        sync: false
+      - key: EMAIL_FROM
+        sync: false   # a sender address verified in your Brevo account
+      - key: EMAIL_FROM_NAME
+        value: Bath Amphibians
