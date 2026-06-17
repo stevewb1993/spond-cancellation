@@ -705,9 +705,10 @@ class TestDoTransfer:
             await _do_transfer("user@example.com", "EVT1", "EVT2")
 
     @pytest.mark.asyncio
+    @patch("app._accept_without_payment")
     @patch("app.aiohttp.ClientSession")
     @patch("app.Spond")
-    async def test_successful_transfer(self, MockSpond, MockSession):
+    async def test_successful_transfer(self, MockSpond, MockSession, mock_accept):
         from app import _do_transfer
 
         member = make_person()
@@ -719,11 +720,10 @@ class TestDoTransfer:
         mock_spond = AsyncMock()
         mock_spond.get_person = AsyncMock(return_value=member)
         mock_spond.get_event = AsyncMock(side_effect=[cancelled, target])
-        mock_spond.change_response = AsyncMock(
-            return_value={"acceptedIds": ["MEM1"]}
-        )
         mock_spond.clientsession = AsyncMock()
         MockSpond.return_value = mock_spond
+
+        mock_accept.return_value = {"acceptedIds": ["MEM1"]}
 
         tx_list = [{"id": "TX1", "paymentName": "STV Swim"}]
         tx_detail = make_transaction(total=350)
@@ -738,6 +738,55 @@ class TestDoTransfer:
 
         result = await _do_transfer("user@example.com", "EVT1", "EVT2")
         assert "acceptedIds" in result
-        mock_spond.change_response.assert_called_once_with(
-            "EVT2", "MEM1", {"accepted": True}
+        # The accept must bypass payment (X-Spond-SkipPayment header path)
+        mock_accept.assert_called_once_with(mock_spond, "EVT2", "MEM1")
+
+
+class TestAcceptWithoutPayment:
+    @pytest.mark.asyncio
+    async def test_sends_skip_payment_header(self):
+        from app import _accept_without_payment
+
+        s = MagicMock()
+        s.token = "tok"
+        s.api_url = "https://api.spond.com/core/v1/"
+        s.auth_headers = {"Authorization": "Bearer tok"}
+
+        captured = {}
+
+        def fake_put(url, headers=None, json=None):
+            captured["url"] = url
+            captured["headers"] = headers
+            captured["json"] = json
+            return MockAsyncContextManager(
+                make_mock_response({"acceptedIds": ["MEM1"]}, status=200)
+            )
+
+        s.clientsession = MagicMock()
+        s.clientsession.put = fake_put
+
+        result = await _accept_without_payment(s, "EVT2", "MEM1")
+
+        assert result == {"acceptedIds": ["MEM1"]}
+        assert captured["headers"]["X-Spond-SkipPayment"] == "true"
+        assert captured["json"] == {"accepted": True}
+        assert "sponds/EVT2/responses/MEM1" in captured["url"]
+
+    @pytest.mark.asyncio
+    async def test_raises_on_payment_required(self):
+        from app import _accept_without_payment
+
+        s = MagicMock()
+        s.token = "tok"
+        s.api_url = "https://api.spond.com/core/v1/"
+        s.auth_headers = {"Authorization": "Bearer tok"}
+
+        resp = make_mock_response({"paymentIntent": "pi_x"}, status=402)
+        resp.text = AsyncMock(return_value='{"paymentIntent": "pi_x"}')
+        s.clientsession = MagicMock()
+        s.clientsession.put = MagicMock(
+            return_value=MockAsyncContextManager(resp)
         )
+
+        with pytest.raises(ValueError, match="HTTP 402"):
+            await _accept_without_payment(s, "EVT2", "MEM1")

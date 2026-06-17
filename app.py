@@ -176,6 +176,30 @@ async def _get_transaction_detail(http_session, club_token, tx_id):
         return await r.json()
 
 
+async def _accept_without_payment(s, event_id, member_id):
+    """Accept a member onto a paid event without charging them.
+
+    The library's change_response can't set custom headers. The organizer
+    web app bypasses the Stripe payment flow by sending the
+    `X-Spond-SkipPayment: true` header (the plain accept now returns an
+    HTTP 402 payment intent without it).
+    """
+    if not s.token:
+        await s.login()
+    url = f"{s.api_url}sponds/{event_id}/responses/{member_id}"
+    headers = {**s.auth_headers, "X-Spond-SkipPayment": "true"}
+    async with s.clientsession.put(
+        url, headers=headers, json={"accepted": True}
+    ) as r:
+        if r.status != 200:
+            body = await r.text()
+            raise ValueError(
+                f"Spond rejected the transfer (HTTP {r.status}). "
+                "Please contact an admin."
+            )
+        return await r.json()
+
+
 async def _find_cancelled_paid_events(email):
     """Find events where the member declined after paying.
 
@@ -371,9 +395,7 @@ async def _do_transfer(email, cancelled_event_id, target_event_id):
                 f"You can only transfer to a session that costs exactly the same."
             )
 
-        result = await s.change_response(
-            target_event_id, member_id, {"accepted": True}
-        )
+        result = await _accept_without_payment(s, target_event_id, member_id)
         return result
     finally:
         await s.clientsession.close()
