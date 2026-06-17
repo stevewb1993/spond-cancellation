@@ -3,7 +3,7 @@
 # connection string into the DATABASE_URL env var in the Render dashboard.
 services:
   - type: web
-    name: spond-session-transfer
+    name: bathamphibs.sessiontransfer
     runtime: python
     plan: free
     buildCommand: pip install uv && uv sync --frozen
