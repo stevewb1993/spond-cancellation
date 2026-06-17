@@ -255,19 +255,27 @@ class TestVerify:
         assert resp.status_code == 302
         assert "/" == resp.headers["Location"] or resp.headers["Location"].endswith("/")
 
-    @patch("app.run_async")
-    def test_correct_code_authenticates(self, mock_run, client):
+    def test_correct_code_authenticates(self, client):
         set_pending_code(client, code="123456")
-        cancelled = [
-            {"event_id": "EVT1", "label": "STV Swim — Fri 20 Jun", "amount_paid": 350}
-        ]
-        mock_run.return_value = (cancelled, "Test User")
         resp = client.post("/verify", data={"code": "123456"})
         assert resp.status_code == 302
-        assert "/cancelled" in resp.headers["Location"]
+        assert "/loading" in resp.headers["Location"]
         with client.session_transaction() as sess:
             assert sess["authenticated"] is True
             assert sess["email"] == "user@example.com"
+
+    def test_loading_page_requires_auth(self, client):
+        resp = client.get("/loading")
+        assert resp.status_code == 302
+        assert resp.headers["Location"].endswith("/")
+
+    def test_loading_page_shown_when_authenticated(self, client):
+        login(client)
+        resp = client.get("/loading")
+        assert resp.status_code == 200
+        assert b"Authentication successful" in resp.data
+        # It should point the browser onward to the sessions page.
+        assert b"/cancelled" in resp.data
 
     def test_wrong_code_shows_error(self, client):
         set_pending_code(client, code="123456")

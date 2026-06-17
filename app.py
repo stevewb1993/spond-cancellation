@@ -499,28 +499,21 @@ def step_verify():
             _clear_pending()
             session["authenticated"] = True
             session["email"] = email
-
-            try:
-                cancelled, member_name = run_async(
-                    _find_cancelled_paid_events(email)
-                )
-            except KeyError:
-                cancelled = []
             session["member_name"] = member_name
-            session["cancelled_events"] = cancelled
-            if not cancelled:
-                flash(
-                    "You're verified, but we couldn't find any paid sessions "
-                    "you've cancelled. Make sure you've declined the session "
-                    "in Spond first.",
-                    "error",
-                )
-            return redirect(url_for("step_cancelled"))
+            # Finding cancelled sessions is slow, so show a loading page
+            # while it runs; the actual lookup happens on /cancelled.
+            return redirect(url_for("loading"))
 
         session["code_attempts"] = session.get("code_attempts", 0) + 1
         flash("That code wasn't correct. Please try again.", "error")
 
     return render_template("step_verify.html", email=session["pending_email"])
+
+
+@app.route("/loading")
+@login_required
+def loading():
+    return render_template("loading.html")
 
 
 @app.route("/cancelled", methods=["GET", "POST"])
