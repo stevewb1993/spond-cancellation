@@ -75,6 +75,18 @@ def _q(query):
     return query.replace("?", "%s") if USE_POSTGRES else query
 
 
+def _is_unique_violation(exc):
+    """True if `exc` is a duplicate-key error from the active backend.
+
+    SQLite raises ``sqlite3.IntegrityError`` with "UNIQUE constraint failed";
+    psycopg raises a ``UniqueViolation`` carrying SQLSTATE 23505. We match on
+    those so an unrelated IntegrityError isn't swallowed.
+    """
+    if isinstance(exc, sqlite3.IntegrityError):
+        return "unique" in str(exc).lower()
+    return getattr(exc, "sqlstate", None) == "23505"
+
+
 def get_db():
     if "db" not in g:
         g.db = _connect()
@@ -109,6 +121,21 @@ def init_db():
             created_at TEXT NOT NULL,
             processed_at TEXT
         )
+    """)
+
+    # A cancelled session funds exactly one transfer, so at most one *approved*
+    # row may exist per (member, cancelled session). This partial unique index
+    # is the durable guard: it makes the database reject a second approved row
+    # from a concurrent double-submit that slips past the in-handler check.
+    #
+    # On a brand-new database (fresh deploy, tests) this just creates the index.
+    # An existing database that predates the index may still hold historical
+    # duplicates, which would make this CREATE fail — clear them first with the
+    # one-off migrations/dedupe_approved_transfers.py before deploying.
+    db.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_one_approved_transfer
+        ON transfer_requests (member_email, cancelled_event_id)
+        WHERE status = 'approved'
     """)
     db.commit()
     db.close()
@@ -764,25 +791,36 @@ def step_target():
                 )
 
             db = get_db()
-            db.execute(
-                _q("""INSERT INTO transfer_requests
-                   (member_name, member_email, cancelled_event_id,
-                    cancelled_event_name, target_event_id, target_event_name,
-                    status, created_at, processed_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"""),
-                (
-                    session.get("member_name", ""),
-                    email,
-                    cancelled_id,
-                    session.get("cancelled_event_label", "Unknown"),
-                    target_id,
-                    selected["label"],
-                    status,
-                    now,
-                    now,
-                ),
-            )
-            db.commit()
+            try:
+                db.execute(
+                    _q("""INSERT INTO transfer_requests
+                       (member_name, member_email, cancelled_event_id,
+                        cancelled_event_name, target_event_id, target_event_name,
+                        status, created_at, processed_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"""),
+                    (
+                        session.get("member_name", ""),
+                        email,
+                        cancelled_id,
+                        session.get("cancelled_event_label", "Unknown"),
+                        target_id,
+                        selected["label"],
+                        status,
+                        now,
+                        now,
+                    ),
+                )
+                db.commit()
+            except Exception as insert_exc:
+                # The unique index rejected this row because an approved
+                # transfer for this (member, cancelled session) already exists
+                # — i.e. a concurrent double-submit (the member reloaded the
+                # page mid-request) raced us here. The Spond accept is
+                # idempotent, so they're correctly added exactly once; just
+                # drop the duplicate log row. Any other error is real — re-raise.
+                db.rollback()
+                if not _is_unique_violation(insert_exc):
+                    raise
 
             # Clear the in-progress selection but keep the member logged in
             # (and drop cancelled_events so it reloads fresh for another go).
