@@ -977,42 +977,47 @@ class TestOneUsePerCancelledSession:
             ).fetchone()["n"]
         assert count == 1
 
-    def test_dedupe_removes_existing_duplicate_approved_rows(self, tmp_path):
-        """init_db cleans up duplicate approved rows that predate the index,
-        so an existing prod DB can adopt the index on the next deploy."""
+    def test_migration_dedupes_existing_rows_and_adds_index(self, tmp_path):
+        """The one-off migration collapses duplicate approved rows that predate
+        the index, so an existing database can adopt the index cleanly."""
+        from migrations.dedupe_approved_transfers import run
+
         db_path = str(tmp_path / "dupes.db")
-        with patch("app.DB_PATH", db_path):
-            # Seed a table with two identical approved rows (the bug's output),
-            # then run init_db and confirm it collapses them to one.
-            raw = sqlite3.connect(db_path)
-            raw.execute("""
-                CREATE TABLE transfer_requests (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    member_name TEXT NOT NULL, member_email TEXT NOT NULL,
-                    cancelled_event_id TEXT NOT NULL,
-                    cancelled_event_name TEXT NOT NULL,
-                    target_event_id TEXT NOT NULL,
-                    target_event_name TEXT NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'pending',
-                    created_at TEXT NOT NULL, processed_at TEXT
-                )
-            """)
-            for _ in range(2):
-                raw.execute(
-                    "INSERT INTO transfer_requests (member_name, member_email, "
-                    "cancelled_event_id, cancelled_event_name, target_event_id, "
-                    "target_event_name, status, created_at) VALUES "
-                    "('Sarah', 's@x.com', 'EVT1', 'C', 'TGT', 'T', 'approved', "
-                    "'2026-06-23T08:16:00')"
-                )
-            raw.commit()
-            raw.close()
+        # Seed a table (no index yet) with two identical approved rows — the
+        # bug's output — then run the migration and confirm it collapses them
+        # to one and the unique index now exists.
+        db = sqlite3.connect(db_path)
+        db.execute("""
+            CREATE TABLE transfer_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                member_name TEXT NOT NULL, member_email TEXT NOT NULL,
+                cancelled_event_id TEXT NOT NULL,
+                cancelled_event_name TEXT NOT NULL,
+                target_event_id TEXT NOT NULL,
+                target_event_name TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL, processed_at TEXT
+            )
+        """)
+        for _ in range(2):
+            db.execute(
+                "INSERT INTO transfer_requests (member_name, member_email, "
+                "cancelled_event_id, cancelled_event_name, target_event_id, "
+                "target_event_name, status, created_at) VALUES "
+                "('Sarah', 's@x.com', 'EVT1', 'C', 'TGT', 'T', 'approved', "
+                "'2026-06-23T08:16:00')"
+            )
+        db.commit()
 
-            init_db()
+        run(db)
 
-            check = sqlite3.connect(db_path)
-            n = check.execute(
-                "SELECT COUNT(*) FROM transfer_requests WHERE status='approved'"
-            ).fetchone()[0]
-            check.close()
+        n = db.execute(
+            "SELECT COUNT(*) FROM transfer_requests WHERE status='approved'"
+        ).fetchone()[0]
+        has_index = db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='index' "
+            "AND name='idx_one_approved_transfer'"
+        ).fetchone()
+        db.close()
         assert n == 1
+        assert has_index is not None

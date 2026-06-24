@@ -123,21 +123,15 @@ def init_db():
         )
     """)
 
-    # A cancelled session funds exactly one transfer, so there must be at most
-    # one *approved* row per (member, cancelled session). A concurrent
-    # double-submit (e.g. the member reloads the page while the first request
-    # is still finishing) used to slip two approved rows past the in-handler
-    # check; this partial unique index makes the database itself reject the
-    # second one. Remove any pre-existing duplicates first, otherwise creating
-    # the index would fail — keep the earliest approved row of each group.
-    db.execute("""
-        DELETE FROM transfer_requests
-        WHERE status = 'approved' AND id NOT IN (
-            SELECT MIN(id) FROM transfer_requests
-            WHERE status = 'approved'
-            GROUP BY member_email, cancelled_event_id
-        )
-    """)
+    # A cancelled session funds exactly one transfer, so at most one *approved*
+    # row may exist per (member, cancelled session). This partial unique index
+    # is the durable guard: it makes the database reject a second approved row
+    # from a concurrent double-submit that slips past the in-handler check.
+    #
+    # On a brand-new database (fresh deploy, tests) this just creates the index.
+    # An existing database that predates the index may still hold historical
+    # duplicates, which would make this CREATE fail — clear them first with the
+    # one-off migrations/dedupe_approved_transfers.py before deploying.
     db.execute("""
         CREATE UNIQUE INDEX IF NOT EXISTS idx_one_approved_transfer
         ON transfer_requests (member_email, cancelled_event_id)
