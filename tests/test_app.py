@@ -116,23 +116,10 @@ def client(tmp_path):
     db_path = str(tmp_path / "test.db")
     app.config["TESTING"] = True
     with patch("app.DB_PATH", db_path):
-        db = sqlite3.connect(db_path)
-        db.execute("""
-            CREATE TABLE IF NOT EXISTS transfer_requests (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                member_name TEXT NOT NULL,
-                member_email TEXT NOT NULL,
-                cancelled_event_id TEXT NOT NULL,
-                cancelled_event_name TEXT NOT NULL,
-                target_event_id TEXT NOT NULL,
-                target_event_name TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                created_at TEXT NOT NULL,
-                processed_at TEXT
-            )
-        """)
-        db.commit()
-        db.close()
+        # Build the schema through the app's own init_db so tests exercise the
+        # real table definition and indexes (e.g. the one-approved-per-session
+        # unique index), not a hand-rolled copy that can drift.
+        init_db()
         with app.test_client() as client:
             yield client
 
@@ -929,3 +916,103 @@ class TestOneUsePerCancelledSession:
         assert b"Done" not in resp.data
         # The transfer itself must never run for a spent session.
         assert mock_run.call_count <= 1
+
+    def test_unique_index_rejects_second_approved_row(self, client):
+        """The DB itself must refuse a second approved transfer for the same
+        (member, cancelled session) — the backstop against concurrent
+        double-submits that the in-handler check can race past."""
+        insert_transfer("EVT1", status="approved")
+        with app.app_context(), pytest.raises(sqlite3.IntegrityError):
+            db = get_db()
+            db.execute(
+                "INSERT INTO transfer_requests (member_name, member_email, "
+                "cancelled_event_id, cancelled_event_name, target_event_id, "
+                "target_event_name, status, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "Test User", "user@example.com", "EVT1", "Cancelled",
+                    "TGT2", "Target2", "approved", "2026-06-17T00:01:00",
+                ),
+            )
+            db.commit()
+
+    def test_unique_index_allows_failed_retry(self, client):
+        """A failed attempt must not block a later approved transfer of the
+        same cancelled session — only approved rows are constrained."""
+        insert_transfer("EVT1", status="failed")
+        insert_transfer("EVT1", status="failed")  # retries are fine
+        insert_transfer("EVT1", status="approved")  # eventual success is fine
+        with app.app_context():
+            used = get_used_cancelled_event_ids("user@example.com")
+        assert used == {"EVT1"}
+
+    def test_duplicate_transfer_post_does_not_error(self, client):
+        """If a transfer succeeds in Spond but the approved row already exists
+        (the losing half of a concurrent double-submit), the member still sees
+        success — the duplicate row is dropped, not surfaced as an error."""
+        insert_transfer("EVT1", status="approved")  # request A already logged it
+        login(
+            client,
+            cancelled_events=[
+                {"event_id": "EVT1", "label": "Monday Swim", "amount_paid": 350}
+            ],
+            cancelled_event_id="EVT1",
+            cancelled_event_label="Monday Swim",
+            amount_paid=350,
+            target_events=[{"id": "EVT2", "label": "Wednesday Swim"}],
+        )
+        # The reused-session guard fires first here (EVT1 is already spent),
+        # so the member is sent back rather than charged again — and crucially
+        # no second approved row is written.
+        with patch("app.run_async", return_value=([], "Test User")):
+            resp = client.post(
+                "/target", data={"target_event": "EVT2"}, follow_redirects=True
+            )
+        assert resp.status_code == 200
+        with app.app_context():
+            db = get_db()
+            count = db.execute(
+                "SELECT COUNT(*) AS n FROM transfer_requests "
+                "WHERE cancelled_event_id = 'EVT1' AND status = 'approved'"
+            ).fetchone()["n"]
+        assert count == 1
+
+    def test_dedupe_removes_existing_duplicate_approved_rows(self, tmp_path):
+        """init_db cleans up duplicate approved rows that predate the index,
+        so an existing prod DB can adopt the index on the next deploy."""
+        db_path = str(tmp_path / "dupes.db")
+        with patch("app.DB_PATH", db_path):
+            # Seed a table with two identical approved rows (the bug's output),
+            # then run init_db and confirm it collapses them to one.
+            raw = sqlite3.connect(db_path)
+            raw.execute("""
+                CREATE TABLE transfer_requests (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    member_name TEXT NOT NULL, member_email TEXT NOT NULL,
+                    cancelled_event_id TEXT NOT NULL,
+                    cancelled_event_name TEXT NOT NULL,
+                    target_event_id TEXT NOT NULL,
+                    target_event_name TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    created_at TEXT NOT NULL, processed_at TEXT
+                )
+            """)
+            for _ in range(2):
+                raw.execute(
+                    "INSERT INTO transfer_requests (member_name, member_email, "
+                    "cancelled_event_id, cancelled_event_name, target_event_id, "
+                    "target_event_name, status, created_at) VALUES "
+                    "('Sarah', 's@x.com', 'EVT1', 'C', 'TGT', 'T', 'approved', "
+                    "'2026-06-23T08:16:00')"
+                )
+            raw.commit()
+            raw.close()
+
+            init_db()
+
+            check = sqlite3.connect(db_path)
+            n = check.execute(
+                "SELECT COUNT(*) FROM transfer_requests WHERE status='approved'"
+            ).fetchone()[0]
+            check.close()
+        assert n == 1
