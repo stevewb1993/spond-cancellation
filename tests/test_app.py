@@ -688,6 +688,66 @@ class TestGetMatchingEvents:
         results = await _get_matching_events(350)
         assert len(results) == 0
 
+    @pytest.mark.asyncio
+    @patch("app.Spond")
+    async def test_includes_session_on_seventh_day(self, MockSpond):
+        """A session dated exactly ~7 days out must still be offered.
+
+        Regression for the date-truncation bug: the Spond library truncates
+        ``max_start`` to midnight, so ``now + 7 days`` used to drop the whole
+        final day and hide a session exactly a week out (e.g. Elizabeth's
+        06:30 S&C on the 11th). We now request a day wider and filter to the
+        precise 7×24h cutoff, so the boundary-day session comes through.
+        """
+        from app import _get_matching_events
+
+        now = datetime.now(timezone.utc)
+        # An early-morning session just under 7×24h away — the case that broke.
+        boundary = make_event(
+            event_id="EVT_7D",
+            heading="S&C",
+            start=(now + timedelta(days=7) - timedelta(hours=1)).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            ),
+            payment_total=750,
+        )
+
+        mock_spond = AsyncMock()
+        mock_spond.get_events = AsyncMock(return_value=[boundary])
+        mock_spond.clientsession = AsyncMock()
+        MockSpond.return_value = mock_spond
+
+        results = await _get_matching_events(750)
+        assert [r["id"] for r in results] == ["EVT_7D"]
+
+    @pytest.mark.asyncio
+    @patch("app.Spond")
+    async def test_excludes_session_beyond_seven_days(self, MockSpond):
+        """A session more than 7×24h away isn't bookable, so must be excluded.
+
+        The API's date-only ``max_start`` can over-return the wider day we ask
+        for; the Python cutoff must still drop anything past the real window.
+        """
+        from app import _get_matching_events
+
+        now = datetime.now(timezone.utc)
+        too_far = make_event(
+            event_id="EVT_8D",
+            heading="S&C",
+            start=(now + timedelta(days=7) + timedelta(hours=2)).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            ),
+            payment_total=750,
+        )
+
+        mock_spond = AsyncMock()
+        mock_spond.get_events = AsyncMock(return_value=[too_far])
+        mock_spond.clientsession = AsyncMock()
+        MockSpond.return_value = mock_spond
+
+        results = await _get_matching_events(750)
+        assert results == []
+
 
 class TestDoTransfer:
     @pytest.mark.asyncio

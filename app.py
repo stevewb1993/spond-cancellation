@@ -373,20 +373,40 @@ async def _find_cancelled_paid_events(email):
 
 
 async def _get_matching_events(amount):
-    """Get future paid events that cost exactly the given amount."""
+    """Get bookable paid events that cost exactly the given amount.
+
+    Only sessions starting within the next 7×24 hours are open for booking, so
+    the window is bounded at exactly ``now + 7 days``.
+
+    The Spond library truncates the ``max_start`` we pass to midnight of that
+    date (its ``_DT_FORMAT`` is ``%Y-%m-%dT00:00:00.000Z``), which would drop
+    every session on the final day — e.g. a session exactly 7 days out is
+    invisible regardless of its time. To work around that we ask the API for a
+    day wider and then enforce the precise 7×24h cutoff ourselves, so sessions
+    on the boundary day are included but anything beyond 7 days is not.
+    """
     s = Spond(SPOND_USERNAME, SPOND_PASSWORD)
     try:
         now = datetime.now(timezone.utc)
+        window_end = now + timedelta(days=7)
         events = await s.get_events(
             min_end=now,
-            max_start=now + timedelta(days=7),
+            max_start=now + timedelta(days=8),
             max_events=50,
         )
-        matching = [
-            event
-            for event in events or []
-            if event.get("payment", {}).get("total") == amount
-        ]
+        matching = []
+        for event in events or []:
+            if event.get("payment", {}).get("total") != amount:
+                continue
+            start = event.get("startTimestamp")
+            if not start:
+                continue
+            # Enforce the real 7×24h upper bound the API's date-only filter can't:
+            # sessions further out than that aren't available to book onto.
+            start_dt = datetime.fromisoformat(start.replace("Z", "+00:00"))
+            if start_dt > window_end:
+                continue
+            matching.append(event)
         # Show the soonest sessions first.
         matching.sort(key=lambda e: e.get("startTimestamp", ""))
         return [
