@@ -19,8 +19,6 @@ services:
         sync: false
       - key: SPOND_PASSWORD
         sync: false
-      - key: SPOND_CLUB_ID
-        sync: false
       - key: ADMIN_PASSWORD
         sync: false
       # Email is sent via the Brevo HTTPS API (Render blocks outbound SMTP).

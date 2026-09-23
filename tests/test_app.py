@@ -9,7 +9,6 @@ import os
 
 os.environ.setdefault("SPOND_USERNAME", "test@example.com")
 os.environ.setdefault("SPOND_PASSWORD", "testpass")
-os.environ.setdefault("SPOND_CLUB_ID", "CLUB123")
 os.environ.setdefault("SECRET_KEY", "test-secret")
 os.environ.setdefault("ADMIN_PASSWORD", "admin")
 
@@ -80,37 +79,6 @@ class MockAsyncContextManager:
         pass
 
 
-def make_mock_response(json_data=None, status=200):
-    resp = MagicMock()
-    resp.status = status
-    resp.json = AsyncMock(return_value=json_data)
-    return resp
-
-
-def make_mock_http_session(get_responses=None, post_responses=None):
-    """Create a mock aiohttp.ClientSession with async context manager support."""
-    mock = MagicMock()
-
-    if post_responses:
-        post_iter = iter(post_responses)
-        mock.post = MagicMock(
-            side_effect=lambda *a, **kw: MockAsyncContextManager(next(post_iter))
-        )
-    else:
-        login_resp = make_mock_response({"loginToken": "tok"})
-        mock.post = MagicMock(
-            return_value=MockAsyncContextManager(login_resp)
-        )
-
-    if get_responses:
-        get_iter = iter(get_responses)
-        mock.get = MagicMock(
-            side_effect=lambda *a, **kw: MockAsyncContextManager(next(get_iter))
-        )
-
-    return mock
-
-
 @pytest.fixture
 def client(tmp_path):
     db_path = str(tmp_path / "test.db")
@@ -160,30 +128,6 @@ def make_person(member_id="MEM1", profile_id="PROF1", email="user@example.com"):
         "firstName": "Test",
         "lastName": "User",
         "email": email,
-    }
-
-
-def make_transaction(
-    tx_id="TX1",
-    payment_name="STV Swim",
-    paid_by_id="PROF1",
-    total=350,
-    paid_at="2026-06-18T10:00:00Z",
-    status="FULFILLED",
-):
-    return {
-        "id": tx_id,
-        "paymentName": payment_name,
-        "total": total,
-        "paidAt": paid_at,
-        "status": status,
-        "paidById": paid_by_id,
-        "paidByName": "Test User",
-        "currency": "GBP",
-        "fee": 29,
-        "refunded": 0,
-        "refunds": [],
-        "feeChargedAsItem": False,
     }
 
 
@@ -697,205 +641,191 @@ class TestImpersonation:
 # --- Transaction matching tests ---
 
 
+def make_payment(member_id="MEM1", total=350, status="FULFILLED"):
+    """A row from Spond's per-session payments endpoint."""
+    return {
+        "id": f"PAY_{member_id}",
+        "status": status,
+        "total": total,
+        "name": "STV Swim",
+        "behalfOfMembershipId": member_id,
+    }
+
+
+def mock_spond_for(member, events=None, get_event=None):
+    mock_spond = AsyncMock()
+    mock_spond.get_person = AsyncMock(return_value=member)
+    mock_spond.get_events = AsyncMock(return_value=events or [])
+    if get_event is not None:
+        mock_spond.get_event = AsyncMock(side_effect=get_event)
+    mock_spond.clientsession = AsyncMock()
+    return mock_spond
+
+
+def payments_by_event(mapping):
+    """Fake _get_session_payments that returns `mapping[event_id]`."""
+    return AsyncMock(side_effect=lambda s, event_id: mapping[event_id])
+
+
 class TestFindCancelledPaidEvents:
-    """Test the logic that matches transactions to declined events."""
-
     @pytest.mark.asyncio
-    @patch("app.aiohttp.ClientSession")
     @patch("app.Spond")
-    async def test_matches_payment_to_closest_event(self, MockSpond, MockSession):
+    async def test_lists_declined_sessions_the_member_paid_for(self, MockSpond):
         from app import _find_cancelled_paid_events
 
-        member = make_person()
-        event_jun17 = make_event(
-            event_id="EVT_JUN17",
-            start="2026-06-17T07:00:00Z",
-            declined_ids=["MEM1"],
+        paid = make_event(event_id="EVT_PAID", declined_ids=["MEM1"])
+        unpaid = make_event(event_id="EVT_UNPAID", declined_ids=["MEM1"])
+        attended = make_event(event_id="EVT_ATTENDED", accepted_ids=["MEM1"])
+        MockSpond.return_value = mock_spond_for(
+            make_person(), events=[paid, unpaid, attended]
         )
-        event_jun22 = make_event(
-            event_id="EVT_JUN22",
-            start="2026-06-22T07:00:00Z",
-            declined_ids=["MEM1"],
-        )
+        fetch = payments_by_event({
+            "EVT_PAID": [make_payment("OTHER"), make_payment("MEM1")],
+            "EVT_UNPAID": [make_payment("OTHER")],
+        })
 
-        tx_list = [{"id": "TX1", "paymentName": "STV Swim"}]
-        tx_detail = make_transaction(paid_at="2026-06-16T10:00:00Z")
+        with patch("app._get_session_payments", fetch):
+            results, name = await _find_cancelled_paid_events("user@example.com")
 
-        mock_spond = AsyncMock()
-        mock_spond.get_person = AsyncMock(return_value=member)
-        mock_spond.get_events = AsyncMock(return_value=[event_jun17, event_jun22])
-        mock_spond.clientsession = AsyncMock()
-        MockSpond.return_value = mock_spond
-
-        mock_http = make_mock_http_session(
-            get_responses=[
-                make_mock_response(tx_list),      # transaction list
-                make_mock_response(tx_detail),     # transaction detail
-            ]
-        )
-        MockSession.return_value = MockAsyncContextManager(mock_http)
-
-        results, name = await _find_cancelled_paid_events("user@example.com")
-
-        assert len(results) == 1
-        assert results[0]["event_id"] == "EVT_JUN17"
-        assert results[0]["amount_paid"] == 350
-
-    @pytest.mark.asyncio
-    @patch("app.aiohttp.ClientSession")
-    @patch("app.Spond")
-    async def test_results_sorted_by_session_date(self, MockSpond, MockSession):
-        from app import _find_cancelled_paid_events
-
-        member = make_person()
-        event_jun17 = make_event(
-            event_id="EVT_JUN17",
-            start="2026-06-17T07:00:00Z",
-            declined_ids=["MEM1"],
-        )
-        event_jun22 = make_event(
-            event_id="EVT_JUN22",
-            start="2026-06-22T07:00:00Z",
-            declined_ids=["MEM1"],
-        )
-
-        tx_list = [
-            {"id": "TX_LATE", "paymentName": "STV Swim"},
-            {"id": "TX_EARLY", "paymentName": "STV Swim"},
+        assert results == [{
+            "event_id": "EVT_PAID",
+            "label": format_event_label(paid),
+            "amount_paid": 350,
+        }]
+        assert name == "Test User"
+        assert sorted(c.args[1] for c in fetch.call_args_list) == [
+            "EVT_PAID", "EVT_UNPAID",
         ]
-        tx_late = make_transaction(tx_id="TX_LATE", paid_at="2026-06-20T10:00:00Z")
-        tx_early = make_transaction(tx_id="TX_EARLY", paid_at="2026-06-16T10:00:00Z")
 
-        mock_spond = AsyncMock()
-        mock_spond.get_person = AsyncMock(return_value=member)
-        mock_spond.get_events = AsyncMock(return_value=[event_jun22, event_jun17])
-        mock_spond.clientsession = AsyncMock()
-        MockSpond.return_value = mock_spond
+    @pytest.mark.asyncio
+    @patch("app.Spond")
+    async def test_payment_for_an_attended_session_does_not_fund_a_later_one(
+        self, MockSpond
+    ):
+        from app import _find_cancelled_paid_events
 
-        mock_http = make_mock_http_session(
-            get_responses=[
-                make_mock_response(tx_list),
-                make_mock_response(tx_late),
-                make_mock_response(tx_early),
-            ]
+        attended = make_event(
+            event_id="EVT_JUN03", start="2026-06-03T07:00:00Z", accepted_ids=["MEM1"]
         )
-        MockSession.return_value = MockAsyncContextManager(mock_http)
+        declined_unpaid = make_event(
+            event_id="EVT_JUN10", start="2026-06-10T07:00:00Z", declined_ids=["MEM1"]
+        )
+        MockSpond.return_value = mock_spond_for(
+            make_person(), events=[attended, declined_unpaid]
+        )
+        fetch = payments_by_event({"EVT_JUN10": [make_payment("OTHER")]})
 
-        results, _ = await _find_cancelled_paid_events("user@example.com")
+        with patch("app._get_session_payments", fetch):
+            results, _ = await _find_cancelled_paid_events("user@example.com")
+
+        assert results == []
+
+    @pytest.mark.asyncio
+    @patch("app.Spond")
+    async def test_results_sorted_by_session_date(self, MockSpond):
+        from app import _find_cancelled_paid_events
+
+        later = make_event(
+            event_id="EVT_JUN22", start="2026-06-22T07:00:00Z", declined_ids=["MEM1"]
+        )
+        earlier = make_event(
+            event_id="EVT_JUN17", start="2026-06-17T07:00:00Z", declined_ids=["MEM1"]
+        )
+        MockSpond.return_value = mock_spond_for(make_person(), events=[later, earlier])
+        fetch = payments_by_event({
+            "EVT_JUN22": [make_payment()],
+            "EVT_JUN17": [make_payment()],
+        })
+
+        with patch("app._get_session_payments", fetch):
+            results, _ = await _find_cancelled_paid_events("user@example.com")
 
         assert [r["event_id"] for r in results] == ["EVT_JUN17", "EVT_JUN22"]
 
     @pytest.mark.asyncio
-    @patch("app.aiohttp.ClientSession")
     @patch("app.Spond")
-    async def test_no_match_for_unpaid_declined_event(self, MockSpond, MockSession):
+    async def test_ignores_free_events(self, MockSpond):
         from app import _find_cancelled_paid_events
 
-        member = make_person()
+        free = make_event(payment_total=None, declined_ids=["MEM1"])
+        MockSpond.return_value = mock_spond_for(make_person(), events=[free])
+        fetch = payments_by_event({})
+
+        with patch("app._get_session_payments", fetch):
+            results, _ = await _find_cancelled_paid_events("user@example.com")
+
+        assert results == []
+        fetch.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch("app.Spond")
+    async def test_ignores_payments_that_are_not_fulfilled(self, MockSpond):
+        from app import _find_cancelled_paid_events
+
         event = make_event(declined_ids=["MEM1"])
+        MockSpond.return_value = mock_spond_for(make_person(), events=[event])
+        fetch = payments_by_event({"EVT1": [make_payment(status="PENDING")]})
 
-        mock_spond = AsyncMock()
-        mock_spond.get_person = AsyncMock(return_value=member)
-        mock_spond.get_events = AsyncMock(return_value=[event])
-        mock_spond.clientsession = AsyncMock()
-        MockSpond.return_value = mock_spond
+        with patch("app._get_session_payments", fetch):
+            results, _ = await _find_cancelled_paid_events("user@example.com")
 
-        mock_http = make_mock_http_session(
-            get_responses=[make_mock_response([])]  # empty transactions
-        )
-        MockSession.return_value = MockAsyncContextManager(mock_http)
-
-        results, name = await _find_cancelled_paid_events("user@example.com")
-        assert len(results) == 0
+        assert results == []
 
     @pytest.mark.asyncio
-    @patch("app.aiohttp.ClientSession")
     @patch("app.Spond")
-    async def test_ignores_free_events(self, MockSpond, MockSession):
+    async def test_amount_paid_comes_from_the_payment(self, MockSpond):
         from app import _find_cancelled_paid_events
 
-        member = make_person()
-        free_event = make_event(payment_total=None, declined_ids=["MEM1"])
+        event = make_event(payment_total=350, declined_ids=["MEM1"])
+        MockSpond.return_value = mock_spond_for(make_person(), events=[event])
+        fetch = payments_by_event({"EVT1": [make_payment(total=300)]})
 
-        mock_spond = AsyncMock()
-        mock_spond.get_person = AsyncMock(return_value=member)
-        mock_spond.get_events = AsyncMock(return_value=[free_event])
-        mock_spond.clientsession = AsyncMock()
-        MockSpond.return_value = mock_spond
+        with patch("app._get_session_payments", fetch):
+            results, _ = await _find_cancelled_paid_events("user@example.com")
 
-        results, name = await _find_cancelled_paid_events("user@example.com")
-        assert len(results) == 0
+        assert results[0]["amount_paid"] == 300
 
     @pytest.mark.asyncio
-    @patch("app.aiohttp.ClientSession")
     @patch("app.Spond")
-    async def test_two_payments_match_two_events(self, MockSpond, MockSession):
+    async def test_a_failed_payments_fetch_raises(self, MockSpond):
         from app import _find_cancelled_paid_events
 
-        member = make_person()
-        event1 = make_event(
-            event_id="EVT1", start="2026-06-17T07:00:00Z", declined_ids=["MEM1"]
-        )
-        event2 = make_event(
-            event_id="EVT2", start="2026-06-22T07:00:00Z", declined_ids=["MEM1"]
-        )
-
-        tx_list = [
-            {"id": "TX1", "paymentName": "STV Swim"},
-            {"id": "TX2", "paymentName": "STV Swim"},
+        events = [
+            make_event(event_id=f"EVT{i}", declined_ids=["MEM1"]) for i in range(3)
         ]
-        tx_detail1 = make_transaction(tx_id="TX1", paid_at="2026-06-16T10:00:00Z")
-        tx_detail2 = make_transaction(tx_id="TX2", paid_at="2026-06-21T10:00:00Z")
+        MockSpond.return_value = mock_spond_for(make_person(), events=events)
 
-        mock_spond = AsyncMock()
-        mock_spond.get_person = AsyncMock(return_value=member)
-        mock_spond.get_events = AsyncMock(return_value=[event1, event2])
-        mock_spond.clientsession = AsyncMock()
-        MockSpond.return_value = mock_spond
+        async def fetch(s, event_id):
+            if event_id == "EVT1":
+                raise RuntimeError("HTTP 503")
+            return [make_payment()]
 
-        mock_http = make_mock_http_session(
-            get_responses=[
-                make_mock_response(tx_list),
-                make_mock_response(tx_detail1),
-                make_mock_response(tx_detail2),
-            ]
-        )
-        MockSession.return_value = MockAsyncContextManager(mock_http)
-
-        results, name = await _find_cancelled_paid_events("user@example.com")
-
-        assert len(results) == 2
-        result_ids = {r["event_id"] for r in results}
-        assert result_ids == {"EVT1", "EVT2"}
+        with (
+            patch("app._get_session_payments", side_effect=fetch),
+            pytest.raises(ExceptionGroup) as exc_info,
+        ):
+            await _find_cancelled_paid_events("user@example.com")
+        assert exc_info.group_contains(RuntimeError, match="503")
 
     @pytest.mark.asyncio
-    @patch("app.aiohttp.ClientSession")
     @patch("app.Spond")
-    async def test_ignores_non_fulfilled_transactions(self, MockSpond, MockSession):
+    async def test_malformed_payment_is_not_mistaken_for_a_missing_member(
+        self, MockSpond
+    ):
         from app import _find_cancelled_paid_events
 
-        member = make_person()
         event = make_event(declined_ids=["MEM1"])
-
-        tx_list = [{"id": "TX1", "paymentName": "STV Swim"}]
-        tx_detail = make_transaction(status="REFUNDED")
-
-        mock_spond = AsyncMock()
-        mock_spond.get_person = AsyncMock(return_value=member)
-        mock_spond.get_events = AsyncMock(return_value=[event])
-        mock_spond.clientsession = AsyncMock()
-        MockSpond.return_value = mock_spond
-
-        mock_http = make_mock_http_session(
-            get_responses=[
-                make_mock_response(tx_list),
-                make_mock_response(tx_detail),
-            ]
+        MockSpond.return_value = mock_spond_for(make_person(), events=[event])
+        fetch = payments_by_event(
+            {"EVT1": [{"behalfOfMembershipId": "MEM1", "status": "FULFILLED"}]}
         )
-        MockSession.return_value = MockAsyncContextManager(mock_http)
 
-        results, name = await _find_cancelled_paid_events("user@example.com")
-        assert len(results) == 0
+        with (
+            patch("app._get_session_payments", fetch),
+            pytest.raises(ExceptionGroup) as exc_info,
+        ):
+            await _find_cancelled_paid_events("user@example.com")
+        assert exc_info.group_contains(KeyError)
 
 
 class TestGetMatchingEvents:
@@ -1014,343 +944,126 @@ class TestGetMatchingEvents:
         assert results == []
 
 
-class TestGetMemberPayments:
-    @pytest.mark.asyncio
-    @patch("app.TX_DETAIL_CONCURRENCY", 3)
-    async def test_fetches_in_parallel_with_a_cap_and_keeps_order(self):
-        import asyncio
-
-        from app import _iter_member_payments
-
-        details = {
-            "TX0": make_transaction(tx_id="TX0"),
-            "TX1": make_transaction(tx_id="TX1", paid_by_id="OTHER"),
-            "TX2": make_transaction(tx_id="TX2", status="PENDING"),
-            **{
-                f"TX{i}": make_transaction(tx_id=f"TX{i}")
-                for i in range(3, 10)
-            },
-        }
-        in_flight = 0
-        peak = 0
-
-        async def fake_detail(http_session, club_token, tx_id):
-            nonlocal in_flight, peak
-            in_flight += 1
-            peak = max(peak, in_flight)
-            await asyncio.sleep(0.001 * (10 - int(tx_id[2:])))
-            in_flight -= 1
-            return details[tx_id]
-
-        with patch("app._get_transaction_detail", side_effect=fake_detail):
-            result = [
-                d async for d in _iter_member_payments(
-                    None,
-                    "tok",
-                    [{"id": tx_id, "paymentName": "STV Swim"} for tx_id in details],
-                    {"STV Swim"},
-                    "PROF1",
-                )
-            ]
-
-        assert [d["id"] for d in result] == ["TX0", *(f"TX{i}" for i in range(3, 10))]
-        assert peak == 3
+class TestGetSessionPayments:
+    def _make_spond(self, status=200, body=None, token="tok"):
+        s = MagicMock()
+        s.token = token
+        s.login = AsyncMock()
+        s.api_url = "https://api.spond.com/core/v1/"
+        s.auth_headers = {"Authorization": "Bearer tok"}
+        resp = MagicMock()
+        resp.status = status
+        resp.json = AsyncMock(return_value=body if body is not None else [])
+        s.clientsession = MagicMock()
+        s.clientsession.get = MagicMock(return_value=MockAsyncContextManager(resp))
+        return s
 
     @pytest.mark.asyncio
-    async def test_no_transactions(self):
-        from app import _iter_member_payments
+    async def test_returns_the_session_payments(self):
+        from app import _get_session_payments
 
-        with patch("app._get_transaction_detail") as mock_detail:
-            assert [
-                d async for d in _iter_member_payments(
-                    None, "tok", [], {"STV Swim"}, "PROF1"
-                )
-            ] == []
-        mock_detail.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_only_fetches_transactions_with_a_matching_heading(self):
-        from app import _iter_member_payments
-
-        with patch(
-            "app._get_transaction_detail",
-            return_value=make_transaction(tx_id="TX1"),
-        ) as mock_detail:
-            result = [
-                d async for d in _iter_member_payments(
-                    None,
-                    "tok",
-                    [
-                        {"id": "TX1", "paymentName": "STV Swim"},
-                        {"id": "TX2", "paymentName": "Open Water"},
-                        {"id": "TX3"},
-                    ],
-                    {"STV Swim"},
-                    "PROF1",
-                )
-            ]
-
-        assert [d["id"] for d in result] == ["TX1"]
-        mock_detail.assert_awaited_once_with(None, "tok", "TX1")
+        s = self._make_spond(body=[make_payment()])
+        assert await _get_session_payments(s, "EVT1") == [make_payment()]
+        call = s.clientsession.get.call_args
+        assert call.args[0] == "https://api.spond.com/core/v1/payments/spond"
+        assert call.kwargs["params"] == {"spondId": "EVT1"}
+        assert call.kwargs["headers"] == s.auth_headers
+        s.login.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_a_failed_fetch_cancels_the_others_before_raising(self):
-        import asyncio
+    async def test_logs_in_first_when_needed(self):
+        from app import _get_session_payments
 
-        from app import _iter_member_payments
-
-        cancelled = []
-
-        async def fake_detail(http_session, club_token, tx_id):
-            if tx_id == "TX0":
-                raise RuntimeError("boom")
-            try:
-                await asyncio.sleep(10)
-            except asyncio.CancelledError:
-                cancelled.append(tx_id)
-                raise
-
-        with (
-            patch("app._get_transaction_detail", side_effect=fake_detail),
-            pytest.raises(RuntimeError, match="boom"),
-        ):
-            [
-                d async for d in _iter_member_payments(
-                    None,
-                    "tok",
-                    [{"id": f"TX{i}", "paymentName": "STV Swim"} for i in range(5)],
-                    {"STV Swim"},
-                    "PROF1",
-                )
-            ]
-
-        assert sorted(cancelled) == ["TX1", "TX2", "TX3", "TX4"]
+        s = self._make_spond(token=None)
+        await _get_session_payments(s, "EVT1")
+        s.login.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_closing_early_cancels_the_rest_and_ignores_their_errors(self):
-        import asyncio
-        from contextlib import aclosing
+    @pytest.mark.parametrize("status", [401, 404, 429, 500])
+    async def test_raises_on_any_non_200(self, status):
+        from app import _get_session_payments
 
-        from app import _iter_member_payments
-
-        cancelled = []
-
-        async def fake_detail(http_session, club_token, tx_id):
-            if tx_id == "TX0":
-                return make_transaction(tx_id="TX0")
-            if tx_id == "TX1":
-                raise RuntimeError("boom")
-            try:
-                await asyncio.sleep(10)
-            except asyncio.CancelledError:
-                cancelled.append(tx_id)
-                raise
-
-        with patch("app._get_transaction_detail", side_effect=fake_detail):
-            async with aclosing(
-                _iter_member_payments(
-                    None,
-                    "tok",
-                    [{"id": f"TX{i}", "paymentName": "STV Swim"} for i in range(4)],
-                    {"STV Swim"},
-                    "PROF1",
-                )
-            ) as payments:
-                first = await anext(payments)
-
-        assert first["id"] == "TX0"
-        assert sorted(cancelled) == ["TX2", "TX3"]
-
-
-class TestGetTransactionDetail:
-    @pytest.mark.asyncio
-    async def test_returns_the_detail(self):
-        from app import _get_transaction_detail
-
-        detail = make_transaction()
-        http = make_mock_http_session(get_responses=[make_mock_response(detail)])
-
-        assert await _get_transaction_detail(http, "tok", "TX1") == detail
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("status", [429, 500, 503])
-    async def test_raises_when_spond_is_throttling_or_failing(self, status):
-        from app import _get_transaction_detail
-
-        http = make_mock_http_session(
-            get_responses=[make_mock_response({"message": "busy"}, status=status)]
-        )
-
-        with pytest.raises(RuntimeError, match=f"HTTP {status}"):
-            await _get_transaction_detail(http, "tok", "TX1")
+        s = self._make_spond(status=status)
+        with pytest.raises(RuntimeError, match=str(status)):
+            await _get_session_payments(s, "EVT1")
 
 
 class TestDoTransfer:
     @pytest.mark.asyncio
-    @patch("app.aiohttp.ClientSession")
     @patch("app.Spond")
-    async def test_rejects_if_not_declined(self, MockSpond, MockSession):
+    async def test_rejects_if_not_declined(self, MockSpond):
         from app import _do_transfer
 
-        member = make_person()
         cancelled = make_event(event_id="EVT1", unanswered_ids=["MEM1"])
         target = make_event(event_id="EVT2")
-
-        mock_spond = AsyncMock()
-        mock_spond.get_person = AsyncMock(return_value=member)
-        mock_spond.get_event = AsyncMock(side_effect=[cancelled, target])
-        mock_spond.clientsession = AsyncMock()
-        MockSpond.return_value = mock_spond
+        MockSpond.return_value = mock_spond_for(
+            make_person(), get_event=[cancelled, target]
+        )
 
         with pytest.raises(ValueError, match="cancelled your spot"):
             await _do_transfer("user@example.com", "EVT1", "EVT2")
 
     @pytest.mark.asyncio
-    @patch("app.aiohttp.ClientSession")
     @patch("app.Spond")
-    async def test_rejects_if_prices_differ(self, MockSpond, MockSession):
+    async def test_rejects_if_prices_differ(self, MockSpond):
         from app import _do_transfer
 
-        member = make_person()
-        cancelled = make_event(
-            event_id="EVT1", payment_total=350, declined_ids=["MEM1"]
-        )
+        cancelled = make_event(event_id="EVT1", payment_total=350, declined_ids=["MEM1"])
         target = make_event(event_id="EVT2", payment_total=500)
-
-        mock_spond = AsyncMock()
-        mock_spond.get_person = AsyncMock(return_value=member)
-        mock_spond.get_event = AsyncMock(side_effect=[cancelled, target])
-        mock_spond.clientsession = AsyncMock()
-        MockSpond.return_value = mock_spond
-
-        tx_list = [{"id": "TX1", "paymentName": "STV Swim"}]
-        tx_detail = make_transaction(total=350)
-
-        mock_http = make_mock_http_session(
-            get_responses=[
-                make_mock_response(tx_list),
-                make_mock_response(tx_detail),
-            ]
+        MockSpond.return_value = mock_spond_for(
+            make_person(), get_event=[cancelled, target]
         )
-        MockSession.return_value = MockAsyncContextManager(mock_http)
+        fetch = payments_by_event({"EVT1": [make_payment(total=350)]})
 
-        with pytest.raises(ValueError, match="prices don't match"):
+        with (
+            patch("app._get_session_payments", fetch),
+            pytest.raises(ValueError, match="prices don't match"),
+        ):
             await _do_transfer("user@example.com", "EVT1", "EVT2")
 
     @pytest.mark.asyncio
-    @patch("app.aiohttp.ClientSession")
+    @pytest.mark.parametrize(
+        "payments",
+        [[], [make_payment("OTHER")], [make_payment(status="PENDING")]],
+        ids=["none", "someone-else", "not-fulfilled"],
+    )
     @patch("app.Spond")
-    async def test_rejects_if_no_payment_found(self, MockSpond, MockSession):
-        from app import _do_transfer
-
-        member = make_person()
-        cancelled = make_event(
-            event_id="EVT1", payment_total=350, declined_ids=["MEM1"]
-        )
-        target = make_event(event_id="EVT2", payment_total=350)
-
-        mock_spond = AsyncMock()
-        mock_spond.get_person = AsyncMock(return_value=member)
-        mock_spond.get_event = AsyncMock(side_effect=[cancelled, target])
-        mock_spond.clientsession = AsyncMock()
-        MockSpond.return_value = mock_spond
-
-        mock_http = make_mock_http_session(
-            get_responses=[make_mock_response([])]  # no transactions
-        )
-        MockSession.return_value = MockAsyncContextManager(mock_http)
-
-        with pytest.raises(ValueError, match="payment record"):
-            await _do_transfer("user@example.com", "EVT1", "EVT2")
-
-    @pytest.mark.asyncio
-    @patch("app._accept_without_payment")
-    @patch("app.aiohttp.ClientSession")
-    @patch("app.Spond")
-    async def test_successful_transfer(self, MockSpond, MockSession, mock_accept):
-        from app import _do_transfer
-
-        member = make_person()
-        cancelled = make_event(
-            event_id="EVT1", payment_total=350, declined_ids=["MEM1"]
-        )
-        target = make_event(event_id="EVT2", payment_total=350)
-
-        mock_spond = AsyncMock()
-        mock_spond.get_person = AsyncMock(return_value=member)
-        mock_spond.get_event = AsyncMock(side_effect=[cancelled, target])
-        mock_spond.clientsession = AsyncMock()
-        MockSpond.return_value = mock_spond
-
-        mock_accept.return_value = {"acceptedIds": ["MEM1"]}
-
-        tx_list = [{"id": "TX1", "paymentName": "STV Swim"}]
-        tx_detail = make_transaction(total=350)
-
-        mock_http = make_mock_http_session(
-            get_responses=[
-                make_mock_response(tx_list),
-                make_mock_response(tx_detail),
-            ]
-        )
-        MockSession.return_value = MockAsyncContextManager(mock_http)
-
-        result = await _do_transfer("user@example.com", "EVT1", "EVT2")
-        assert "acceptedIds" in result
-        # The accept must bypass payment (X-Spond-SkipPayment header path)
-        mock_accept.assert_called_once_with(mock_spond, "EVT2", "MEM1")
-
-    @pytest.mark.asyncio
-    @patch("app._accept_without_payment")
-    @patch("app.aiohttp.ClientSession")
-    @patch("app.Spond")
-    async def test_uses_the_first_payment_before_the_event_and_stops_there(
-        self, MockSpond, MockSession, mock_accept
+    async def test_rejects_if_member_did_not_pay_for_that_session(
+        self, MockSpond, payments
     ):
         from app import _do_transfer
 
-        member = make_person()
-        cancelled = make_event(
-            event_id="EVT1", payment_total=350, declined_ids=["MEM1"]
-        )
+        cancelled = make_event(event_id="EVT1", payment_total=350, declined_ids=["MEM1"])
         target = make_event(event_id="EVT2", payment_total=350)
-
-        mock_spond = AsyncMock()
-        mock_spond.get_person = AsyncMock(return_value=member)
-        mock_spond.get_event = AsyncMock(side_effect=[cancelled, target])
-        mock_spond.clientsession = AsyncMock()
-        MockSpond.return_value = mock_spond
-
-        mock_accept.return_value = {"acceptedIds": ["MEM1"]}
-
-        details = {
-            "TX1": make_transaction(
-                tx_id="TX1", total=999, paid_at="2026-06-25T10:00:00Z"
-            ),
-            "TX2": make_transaction(tx_id="TX2", total=999, paid_by_id="OTHER"),
-            "TX3": make_transaction(tx_id="TX3", total=350),
-            "TX4": make_transaction(
-                tx_id="TX4", total=500, paid_at="2026-06-10T10:00:00Z"
-            ),
-        }
-
-        async def fake_detail(http_session, club_token, tx_id):
-            if tx_id == "TX5":
-                raise RuntimeError("boom")
-            return details[tx_id]
-
-        tx_list = [
-            {"id": f"TX{i}", "paymentName": "STV Swim"} for i in range(1, 6)
-        ]
-        mock_http = make_mock_http_session(
-            get_responses=[make_mock_response(tx_list)]
+        MockSpond.return_value = mock_spond_for(
+            make_person(), get_event=[cancelled, target]
         )
-        MockSession.return_value = MockAsyncContextManager(mock_http)
+        fetch = payments_by_event({"EVT1": payments})
 
-        with patch("app._get_transaction_detail", side_effect=fake_detail):
+        with (
+            patch("app._get_session_payments", fetch),
+            pytest.raises(ValueError, match="payment record"),
+        ):
+            await _do_transfer("user@example.com", "EVT1", "EVT2")
+
+    @pytest.mark.asyncio
+    @patch("app._accept_without_payment")
+    @patch("app.Spond")
+    async def test_successful_transfer(self, MockSpond, mock_accept):
+        from app import _do_transfer
+
+        cancelled = make_event(event_id="EVT1", payment_total=350, declined_ids=["MEM1"])
+        target = make_event(event_id="EVT2", payment_total=350)
+        mock_spond = mock_spond_for(make_person(), get_event=[cancelled, target])
+        MockSpond.return_value = mock_spond
+        mock_accept.return_value = {"acceptedIds": ["MEM1"]}
+        fetch = payments_by_event({"EVT1": [make_payment("OTHER"), make_payment()]})
+
+        with patch("app._get_session_payments", fetch):
             result = await _do_transfer("user@example.com", "EVT1", "EVT2")
 
         assert "acceptedIds" in result
+        fetch.assert_awaited_once_with(mock_spond, "EVT1")
         mock_accept.assert_called_once_with(mock_spond, "EVT2", "MEM1")
 
 
