@@ -621,16 +621,23 @@ class TestImpersonation:
         assert b"Stop impersonating" not in resp.data
 
     @patch("app.run_async")
-    def test_transfer_blocked_while_impersonating(self, mock_run, client):
+    def test_transfer_goes_through_while_impersonating(self, mock_run, client):
         impersonate(client, **TARGET_STATE)
+        mock_run.side_effect = [
+            {"acceptedIds": ["MEM1"]},
+            ([], "Test User"),
+        ]
         resp = client.post(
             "/target", data={"target_event": "EVT2"}, follow_redirects=True
         )
-        assert b"Transfers are disabled while impersonating" in resp.data
-        mock_run.assert_not_called()
+        assert b"Done" in resp.data
         with app.app_context():
             rows = get_db().execute("SELECT * FROM transfer_requests").fetchall()
-        assert rows == []
+        assert [(r["member_email"], r["status"]) for r in rows] == [
+            ("user@example.com", "approved")
+        ]
+        with client.session_transaction() as sess:
+            assert sess["impersonating"] is True
 
     def test_target_page_still_viewable_while_impersonating(self, client):
         impersonate(client, **TARGET_STATE)

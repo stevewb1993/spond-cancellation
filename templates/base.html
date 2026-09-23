@@ -117,7 +117,7 @@
     {% if session.impersonating %}
     <div class="impersonation-banner">
         Impersonating <strong>{{ session.member_name or session.email }}</strong>
-        ({{ session.email }}). Transfers are disabled.
+        ({{ session.email }}). Transfers are real.
         <a href="{{ url_for('admin_stop_impersonating') }}">Stop impersonating</a>
     </div>
     {% endif %}

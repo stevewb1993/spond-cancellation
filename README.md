@@ -19,7 +19,7 @@ All transfers are logged in a local SQLite database and viewable at `/admin`.
 - **Club members only.** The Spond admin account only sees its own club's members, so an email that isn't a club member can't request a code.
 - **Verified email.** A member can only act on the sessions belonging to the email they verified — every step keys off that verified email, and the transfer is re-verified server-side before it goes through.
 - Verification codes expire after 10 minutes and allow 5 attempts before a new code is required.
-- **Admin impersonation.** A logged-in admin can enter a member's email at `/admin` to see the app as that member, with no verification code. A banner stays at the top of each page while this is on. Transfers are disabled while impersonating, so debugging cannot change a member's Spond bookings.
+- **Admin impersonation.** A logged-in admin can enter a member's email at `/admin` to see the app as that member, with no verification code. A banner stays at the top of each page while this is on. Transfers made while impersonating are real: they add the member to the session in Spond and use up their cancelled session.
 
 ## Verification
 

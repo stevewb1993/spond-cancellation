@@ -777,10 +777,6 @@ def step_target():
     target_events = session["target_events"]
 
     if request.method == "POST":
-        if session.get("impersonating"):
-            flash("Transfers are disabled while impersonating a member.", "error")
-            return redirect(url_for("step_target"))
-
         target_id = request.form.get("target_event")
         selected = next(
             (e for e in target_events if e["id"] == target_id), None
