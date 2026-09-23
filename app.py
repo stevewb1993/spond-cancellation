@@ -389,13 +389,14 @@ async def _find_cancelled_paid_events(email):
             if best_event is not None:
                 matched_event_ids.add(best_event["id"])
                 matched_tx_ids.add(tx["id"])
-                results.append({
+                results.append((best_event["startTimestamp"], {
                     "event_id": best_event["id"],
                     "label": format_event_label(best_event),
                     "amount_paid": tx["total"],
-                })
+                }))
 
-        return results, member_name
+        results.sort(key=lambda r: r[0])
+        return [r for _, r in results], member_name
     finally:
         await s.clientsession.close()
 

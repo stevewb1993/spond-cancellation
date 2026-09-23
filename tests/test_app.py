@@ -733,6 +733,50 @@ class TestFindCancelledPaidEvents:
     @pytest.mark.asyncio
     @patch("app.aiohttp.ClientSession")
     @patch("app.Spond")
+    async def test_results_sorted_by_session_date(self, MockSpond, MockSession):
+        from app import _find_cancelled_paid_events
+
+        member = make_person()
+        event_jun17 = make_event(
+            event_id="EVT_JUN17",
+            start="2026-06-17T07:00:00Z",
+            declined_ids=["MEM1"],
+        )
+        event_jun22 = make_event(
+            event_id="EVT_JUN22",
+            start="2026-06-22T07:00:00Z",
+            declined_ids=["MEM1"],
+        )
+
+        tx_list = [
+            {"id": "TX_LATE", "paymentName": "STV Swim"},
+            {"id": "TX_EARLY", "paymentName": "STV Swim"},
+        ]
+        tx_late = make_transaction(tx_id="TX_LATE", paid_at="2026-06-20T10:00:00Z")
+        tx_early = make_transaction(tx_id="TX_EARLY", paid_at="2026-06-16T10:00:00Z")
+
+        mock_spond = AsyncMock()
+        mock_spond.get_person = AsyncMock(return_value=member)
+        mock_spond.get_events = AsyncMock(return_value=[event_jun22, event_jun17])
+        mock_spond.clientsession = AsyncMock()
+        MockSpond.return_value = mock_spond
+
+        mock_http = make_mock_http_session(
+            get_responses=[
+                make_mock_response(tx_list),
+                make_mock_response(tx_late),
+                make_mock_response(tx_early),
+            ]
+        )
+        MockSession.return_value = MockAsyncContextManager(mock_http)
+
+        results, _ = await _find_cancelled_paid_events("user@example.com")
+
+        assert [r["event_id"] for r in results] == ["EVT_JUN17", "EVT_JUN22"]
+
+    @pytest.mark.asyncio
+    @patch("app.aiohttp.ClientSession")
+    @patch("app.Spond")
     async def test_no_match_for_unpaid_declined_event(self, MockSpond, MockSession):
         from app import _find_cancelled_paid_events
 
