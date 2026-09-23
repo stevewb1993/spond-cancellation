@@ -479,7 +479,6 @@ def admin_login(client):
 
 
 def impersonate(client, **extra):
-    """Put the test client into an admin-impersonating-a-member session."""
     admin_login(client)
     login(client, impersonating=True, **extra)
 
@@ -565,8 +564,40 @@ class TestImpersonation:
         impersonate(client, cancelled_events=[])
         resp = client.get("/cancelled")
         assert b"Stop impersonating" in resp.data
-        assert b"Test User" in resp.data
+        assert b"Impersonating <strong>Test User</strong>" in resp.data
         assert b"/admin/stop-impersonating" in resp.data
+
+    def test_loading_page_names_impersonated_member(self, client):
+        impersonate(client)
+        resp = client.get("/loading")
+        assert b"Impersonating Test User" in resp.data
+        assert b"Authentication successful" not in resp.data
+
+    @patch("app.run_async")
+    def test_lookup_failure_shows_error(self, mock_run, client):
+        admin_login(client)
+        mock_run.side_effect = RuntimeError("spond down")
+        resp = client.post(
+            "/admin/impersonate",
+            data={"member_email": "jane@example.com"},
+            follow_redirects=True,
+        )
+        assert resp.status_code == 200
+        assert b"look up that member" in resp.data
+        with client.session_transaction() as sess:
+            assert sess["admin"] is True
+            assert "impersonating" not in sess
+
+    @patch("app.run_async")
+    def test_impersonation_is_logged(self, mock_run, client, caplog):
+        admin_login(client)
+        mock_run.return_value = "Jane Member"
+        client.post("/admin/impersonate", data={"member_email": "jane@example.com"})
+        assert "Admin started impersonating jane@example.com" in caplog.text
+
+    def test_session_cookie_is_samesite_lax(self, client):
+        resp = client.post("/admin", data={"action": "login", "password": "admin"})
+        assert "SameSite=Lax" in resp.headers["Set-Cookie"]
 
     def test_no_banner_for_real_member(self, client):
         login(client, cancelled_events=[])

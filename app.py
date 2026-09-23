@@ -25,6 +25,7 @@ from spond.spond import Spond
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "dev-secret-change-me")
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 
 SPOND_USERNAME = os.environ.get("SPOND_USERNAME", "")
 SPOND_PASSWORD = os.environ.get("SPOND_PASSWORD", "")
@@ -540,14 +541,18 @@ def _clear_pending():
         session.pop(key, None)
 
 
-def _clear_member():
-    """Sign the current member out, leaving any admin login in place."""
-    _clear_pending()
+def _clear_flow():
     for key in (
-        "authenticated", "email", "member_name", "impersonating",
         "cancelled_events", "cancelled_event_id", "cancelled_event_label",
         "amount_paid", "target_events",
     ):
+        session.pop(key, None)
+
+
+def _clear_member():
+    _clear_pending()
+    _clear_flow()
+    for key in ("authenticated", "email", "member_name", "impersonating"):
         session.pop(key, None)
 
 
@@ -724,11 +729,11 @@ def step_target():
 
     target_events = session["target_events"]
 
-    if request.method == "POST" and session.get("impersonating"):
-        flash("Transfers are disabled while impersonating a member.", "error")
-        return redirect(url_for("step_target"))
-
     if request.method == "POST":
+        if session.get("impersonating"):
+            flash("Transfers are disabled while impersonating a member.", "error")
+            return redirect(url_for("step_target"))
+
         target_id = request.form.get("target_event")
         selected = next(
             (e for e in target_events if e["id"] == target_id), None
@@ -742,11 +747,7 @@ def step_target():
             # Re-check here too: the cancelled session must not already be
             # spent (guards against stale sessions and double submits).
             if cancelled_id in get_used_cancelled_event_ids(email):
-                for key in [
-                    "cancelled_events", "cancelled_event_id",
-                    "cancelled_event_label", "amount_paid", "target_events",
-                ]:
-                    session.pop(key, None)
+                _clear_flow()
                 flash(
                     "You've already used that cancelled session to transfer to "
                     "another session. Each cancelled session can only be used once.",
@@ -801,12 +802,7 @@ def step_target():
 
             # Clear the in-progress selection but keep the member logged in
             # (and drop cancelled_events so it reloads fresh for another go).
-            for key in [
-                "cancelled_events",
-                "cancelled_event_id", "cancelled_event_label",
-                "amount_paid", "target_events",
-            ]:
-                session.pop(key, None)
+            _clear_flow()
 
             return redirect(url_for("step_cancelled"))
 
@@ -850,8 +846,6 @@ def admin():
 
 @app.route("/admin/impersonate", methods=["POST"])
 def admin_impersonate():
-    """Sign the admin in as a member, skipping email verification, so they see
-    exactly what that member sees."""
     if not session.get("admin"):
         return redirect(url_for("admin"))
 
@@ -865,12 +859,20 @@ def admin_impersonate():
     except KeyError:
         flash(f"No club member found with the email {email}.", "error")
         return redirect(url_for("admin"))
+    except Exception:
+        app.logger.exception("Member lookup failed while starting impersonation")
+        flash(
+            "Couldn't look up that member in Spond right now. Please try again.",
+            "error",
+        )
+        return redirect(url_for("admin"))
 
     _clear_member()
     session["authenticated"] = True
     session["email"] = email
     session["member_name"] = member_name
     session["impersonating"] = True
+    app.logger.warning("Admin started impersonating %s", email)
     return redirect(url_for("loading"))
 
 
