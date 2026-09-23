@@ -540,6 +540,17 @@ def _clear_pending():
         session.pop(key, None)
 
 
+def _clear_member():
+    """Sign the current member out, leaving any admin login in place."""
+    _clear_pending()
+    for key in (
+        "authenticated", "email", "member_name", "impersonating",
+        "cancelled_events", "cancelled_event_id", "cancelled_event_label",
+        "amount_paid", "target_events",
+    ):
+        session.pop(key, None)
+
+
 def login_required(view):
     """Guard a view so only members who've verified their email can reach it."""
 
@@ -713,6 +724,10 @@ def step_target():
 
     target_events = session["target_events"]
 
+    if request.method == "POST" and session.get("impersonating"):
+        flash("Transfers are disabled while impersonating a member.", "error")
+        return redirect(url_for("step_target"))
+
     if request.method == "POST":
         target_id = request.form.get("target_event")
         selected = next(
@@ -805,6 +820,9 @@ def step_target():
 
 @app.route("/logout")
 def logout():
+    if session.get("impersonating"):
+        _clear_member()
+        return redirect(url_for("admin"))
     session.clear()
     flash("You've been logged out.", "success")
     return redirect(url_for("step_email"))
@@ -830,8 +848,43 @@ def admin():
     return render_template("admin.html", requests=requests)
 
 
+@app.route("/admin/impersonate", methods=["POST"])
+def admin_impersonate():
+    """Sign the admin in as a member, skipping email verification, so they see
+    exactly what that member sees."""
+    if not session.get("admin"):
+        return redirect(url_for("admin"))
+
+    email = request.form.get("member_email", "").strip()
+    if not email:
+        flash("Please enter the member's email.", "error")
+        return redirect(url_for("admin"))
+
+    try:
+        member_name = run_async(_lookup_member(email))
+    except KeyError:
+        flash(f"No club member found with the email {email}.", "error")
+        return redirect(url_for("admin"))
+
+    _clear_member()
+    session["authenticated"] = True
+    session["email"] = email
+    session["member_name"] = member_name
+    session["impersonating"] = True
+    return redirect(url_for("loading"))
+
+
+@app.route("/admin/stop-impersonating")
+def admin_stop_impersonating():
+    if session.get("impersonating"):
+        _clear_member()
+    return redirect(url_for("admin"))
+
+
 @app.route("/admin/logout")
 def admin_logout():
+    if session.get("impersonating"):
+        _clear_member()
     session.pop("admin", None)
     return redirect(url_for("admin"))
 

@@ -473,6 +473,162 @@ class TestAdmin:
         assert b"password" in resp.data.lower()
 
 
+def admin_login(client):
+    with client.session_transaction() as sess:
+        sess["admin"] = True
+
+
+def impersonate(client, **extra):
+    """Put the test client into an admin-impersonating-a-member session."""
+    admin_login(client)
+    login(client, impersonating=True, **extra)
+
+
+TARGET_STATE = {
+    "cancelled_event_id": "EVT1",
+    "cancelled_event_label": "STV Swim — Fri 20 Jun",
+    "amount_paid": 350,
+    "target_events": [{"id": "EVT2", "label": "STV Swim — Mon 23 Jun"}],
+}
+
+
+class TestImpersonation:
+    def test_admin_page_shows_impersonate_form(self, client):
+        admin_login(client)
+        resp = client.get("/admin")
+        assert b'action="/admin/impersonate"' in resp.data
+
+    @patch("app.run_async")
+    def test_requires_admin(self, mock_run, client):
+        resp = client.post(
+            "/admin/impersonate", data={"member_email": "user@example.com"}
+        )
+        assert resp.status_code == 302
+        assert resp.headers["Location"].endswith("/admin")
+        mock_run.assert_not_called()
+        with client.session_transaction() as sess:
+            assert "authenticated" not in sess
+            assert "impersonating" not in sess
+
+    @patch("app.run_async")
+    def test_signs_in_as_member_without_code(self, mock_run, client):
+        admin_login(client)
+        mock_run.return_value = "Jane Member"
+        resp = client.post(
+            "/admin/impersonate", data={"member_email": " jane@example.com "}
+        )
+        assert resp.status_code == 302
+        assert resp.headers["Location"].endswith("/loading")
+        with client.session_transaction() as sess:
+            assert sess["authenticated"] is True
+            assert sess["email"] == "jane@example.com"
+            assert sess["member_name"] == "Jane Member"
+            assert sess["impersonating"] is True
+            assert sess["admin"] is True
+
+    @patch("app.run_async")
+    def test_drops_previous_member_state(self, mock_run, client):
+        admin_login(client)
+        login(client, cancelled_events=[{"event_id": "OLD"}], **TARGET_STATE)
+        mock_run.return_value = "Jane Member"
+        client.post("/admin/impersonate", data={"member_email": "jane@example.com"})
+        with client.session_transaction() as sess:
+            for key in ("cancelled_events", *TARGET_STATE):
+                assert key not in sess
+
+    @patch("app.run_async")
+    def test_unknown_email(self, mock_run, client):
+        admin_login(client)
+        mock_run.side_effect = KeyError("nobody@example.com")
+        resp = client.post(
+            "/admin/impersonate",
+            data={"member_email": "nobody@example.com"},
+            follow_redirects=True,
+        )
+        assert b"No club member found" in resp.data
+        with client.session_transaction() as sess:
+            assert "authenticated" not in sess
+            assert "impersonating" not in sess
+
+    @patch("app.run_async")
+    def test_empty_email(self, mock_run, client):
+        admin_login(client)
+        resp = client.post(
+            "/admin/impersonate",
+            data={"member_email": "  "},
+            follow_redirects=True,
+        )
+        assert b"enter the member" in resp.data
+        mock_run.assert_not_called()
+
+    def test_banner_shown_while_impersonating(self, client):
+        impersonate(client, cancelled_events=[])
+        resp = client.get("/cancelled")
+        assert b"Stop impersonating" in resp.data
+        assert b"Test User" in resp.data
+        assert b"/admin/stop-impersonating" in resp.data
+
+    def test_no_banner_for_real_member(self, client):
+        login(client, cancelled_events=[])
+        resp = client.get("/cancelled")
+        assert b"Stop impersonating" not in resp.data
+
+    @patch("app.run_async")
+    def test_transfer_blocked_while_impersonating(self, mock_run, client):
+        impersonate(client, **TARGET_STATE)
+        resp = client.post(
+            "/target", data={"target_event": "EVT2"}, follow_redirects=True
+        )
+        assert b"Transfers are disabled while impersonating" in resp.data
+        mock_run.assert_not_called()
+        with app.app_context():
+            rows = get_db().execute("SELECT * FROM transfer_requests").fetchall()
+        assert rows == []
+
+    def test_target_page_still_viewable_while_impersonating(self, client):
+        impersonate(client, **TARGET_STATE)
+        resp = client.get("/target")
+        assert resp.status_code == 200
+        assert b"STV Swim" in resp.data
+
+    def test_stop_impersonating_keeps_admin(self, client):
+        impersonate(client, cancelled_events=[], **TARGET_STATE)
+        resp = client.get("/admin/stop-impersonating")
+        assert resp.headers["Location"].endswith("/admin")
+        with client.session_transaction() as sess:
+            assert sess["admin"] is True
+            for key in (
+                "authenticated", "email", "member_name", "impersonating",
+                "cancelled_events", *TARGET_STATE,
+            ):
+                assert key not in sess
+
+    def test_stop_impersonating_leaves_real_member_alone(self, client):
+        login(client)
+        client.get("/admin/stop-impersonating")
+        with client.session_transaction() as sess:
+            assert sess["authenticated"] is True
+            assert sess["email"] == "user@example.com"
+
+    def test_logout_while_impersonating_returns_to_admin(self, client):
+        impersonate(client)
+        resp = client.get("/logout")
+        assert resp.headers["Location"].endswith("/admin")
+        with client.session_transaction() as sess:
+            assert sess["admin"] is True
+            assert "authenticated" not in sess
+            assert "impersonating" not in sess
+
+    def test_admin_logout_ends_impersonation(self, client):
+        impersonate(client)
+        client.get("/admin/logout")
+        with client.session_transaction() as sess:
+            assert "admin" not in sess
+            assert "authenticated" not in sess
+            assert "email" not in sess
+            assert "impersonating" not in sess
+
+
 # --- Transaction matching tests ---
 
 
