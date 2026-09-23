@@ -51,11 +51,10 @@ cp .env.example .env
 | `SPOND_PASSWORD` | Your Spond password |
 | `ADMIN_PASSWORD` | Password for the `/admin` page (admin login is disabled if unset) |
 | `SECRET_KEY` | Flask session secret (use a random string) |
-| `SMTP_HOST` | SMTP server for sending codes (default `smtp.gmail.com`) |
-| `SMTP_PORT` | SMTP port (default `587`, STARTTLS) |
-| `SMTP_USERNAME` | The sending email account (e.g. `bathamphibiansbookings@gmail.com`) |
-| `SMTP_PASSWORD` | Gmail **App Password** (16 chars, requires 2FA) — not your normal password |
-| `SMTP_FROM` | From address on the emails (defaults to `SMTP_USERNAME`) |
+| `BREVO_API_KEY` | Brevo API key that sends the verification codes |
+| `EMAIL_FROM` | Sender address, verified in Brevo (e.g. `bathamphibiansbookings@gmail.com`) |
+| `EMAIL_FROM_NAME` | Sender name on the emails (default `Bath Amphibians`) |
+| `DATABASE_URL` | Postgres connection string; leave unset to use a local SQLite file |
 
 ### Setting up email (Brevo)
 
@@ -95,7 +94,7 @@ Hosted free on **Render** (web service) + **Neon** (Postgres):
    provisions a free web service.
 4. In the Render dashboard, fill in the env vars marked `sync: false` —
    especially `DATABASE_URL` (the Neon string), the `SPOND_*`, `ADMIN_PASSWORD`,
-   and `SMTP_*` values. `SECRET_KEY` is generated automatically.
+   `BREVO_API_KEY` and `EMAIL_FROM` values. `SECRET_KEY` is generated automatically.
 
 The free web service sleeps after ~15 minutes of inactivity and takes ~30–60s to
 wake on the next request — fine for low-traffic use. Neon's free tier is

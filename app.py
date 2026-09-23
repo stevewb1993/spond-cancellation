@@ -161,6 +161,10 @@ def get_used_cancelled_event_ids(member_email):
 # --- Spond helpers ---
 
 
+class TransferFailed(Exception):
+    """A transfer failure whose message is safe to show the member."""
+
+
 def run_async(coro):
     loop = asyncio.new_event_loop()
     try:
@@ -200,7 +204,7 @@ async def _get_session_payments(s, event_id):
             raise RuntimeError(
                 f"Spond payments for session {event_id} failed: HTTP {r.status}"
             )
-        return await r.json()
+        return await r.json() or []
 
 
 def _amount_member_paid(payments, member_id):
@@ -252,7 +256,7 @@ async def _accept_without_payment(s, event_id, member_id):
         body = await r.text()
         if r.status != 200:
             print(f"[transfer] accept rejected: HTTP {r.status} body={body[:300]}")
-            raise ValueError(
+            raise TransferFailed(
                 f"Spond rejected the transfer (HTTP {r.status}). "
                 "You have not been added. Please contact an admin."
             )
@@ -264,7 +268,7 @@ async def _accept_without_payment(s, event_id, member_id):
     if member_id in responses.get("acceptedIds", []):
         return responses
     if member_id in responses.get("waitinglistIds", []):
-        raise ValueError(
+        raise TransferFailed(
             "That session looks full — you've been put on the waiting list "
             "rather than confirmed. Please contact an admin."
         )
@@ -273,7 +277,7 @@ async def _accept_without_payment(s, event_id, member_id):
         f"[transfer] post-check failed: {member_id} not in acceptedIds for "
         f"{event_id}; response buckets={counts}"
     )
-    raise ValueError(
+    raise TransferFailed(
         "The transfer didn't take effect in Spond — you have not been added. "
         "Please contact an admin."
     )
@@ -305,6 +309,7 @@ async def _find_cancelled_paid_events(email):
             if member_id not in declined_ids:
                 continue
             declined_events.append(event)
+        declined_events.sort(key=lambda e: e["startTimestamp"])
 
         semaphore = asyncio.Semaphore(SESSION_PAYMENTS_CONCURRENCY)
 
@@ -316,19 +321,14 @@ async def _find_cancelled_paid_events(email):
         async with asyncio.TaskGroup() as tg:
             tasks = [tg.create_task(amount_paid_for(e)) for e in declined_events]
 
-        paid = [
-            (event, task.result())
-            for event, task in zip(declined_events, tasks)
-            if task.result() is not None
-        ]
-        paid.sort(key=lambda p: p[0]["startTimestamp"])
         return [
             {
                 "event_id": event["id"],
                 "label": format_event_label(event),
                 "amount_paid": amount,
             }
-            for event, amount in paid
+            for event, task in zip(declined_events, tasks, strict=True)
+            if (amount := task.result()) is not None
         ], member_name
     finally:
         await s.clientsession.close()
@@ -392,7 +392,7 @@ async def _do_transfer(email, cancelled_event_id, target_event_id):
         # Verify declined
         declined_ids = cancelled_event.get("responses", {}).get("declinedIds", [])
         if member_id not in declined_ids:
-            raise ValueError(
+            raise TransferFailed(
                 "You don't appear to have cancelled your spot on that session. "
                 "Make sure you've declined the session in Spond first."
             )
@@ -405,13 +405,13 @@ async def _do_transfer(email, cancelled_event_id, target_event_id):
         )
 
         if amount_paid is None:
-            raise ValueError(
+            raise TransferFailed(
                 "We couldn't find a payment record for that session. "
                 "If you believe this is an error, please contact an admin."
             )
 
         if amount_paid != target_price:
-            raise ValueError(
+            raise TransferFailed(
                 f"The session prices don't match "
                 f"(£{amount_paid / 100:.2f} vs £{target_price / 100:.2f}). "
                 f"You can only transfer to a session that costs exactly the same."
@@ -659,9 +659,18 @@ def step_cancelled():
         if not selected:
             flash("Please select a session.", "error")
         else:
-            target_events = run_async(
-                _get_matching_events(selected["amount_paid"])
-            )
+            try:
+                target_events = run_async(
+                    _get_matching_events(selected["amount_paid"])
+                )
+            except Exception:
+                app.logger.exception("Failed to load target sessions from Spond")
+                flash(
+                    "We couldn't load upcoming sessions from Spond right now. "
+                    "Please try again in a minute, or contact an admin.",
+                    "error",
+                )
+                return render_template("step_cancelled.html", events=cancelled_events)
             # Exclude the cancelled event itself
             target_events = [
                 e for e in target_events if e["id"] != cancelled_id
@@ -721,7 +730,7 @@ def step_target():
                     f"Done! You've been added to {selected['label']}.",
                     "success",
                 )
-            except ValueError as e:
+            except TransferFailed as e:
                 # Expected, user-actionable failures carry a friendly message
                 # (declined check, price mismatch, transfer didn't take, etc.).
                 status = "failed"

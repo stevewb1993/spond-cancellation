@@ -13,6 +13,7 @@ os.environ.setdefault("SECRET_KEY", "test-secret")
 os.environ.setdefault("ADMIN_PASSWORD", "admin")
 
 from app import (
+    TransferFailed,
     app,
     format_event_label,
     get_db,
@@ -121,10 +122,10 @@ def make_event(
     return event
 
 
-def make_person(member_id="MEM1", profile_id="PROF1", email="user@example.com"):
+def make_person(member_id="MEM1", email="user@example.com"):
     return {
         "id": member_id,
-        "profile": {"id": profile_id},
+        "profile": {"id": "PROF1"},
         "firstName": "Test",
         "lastName": "User",
         "email": email,
@@ -313,6 +314,31 @@ class TestStepCancelled:
         with client.session_transaction() as sess:
             assert "cancelled_events" not in sess
 
+    @patch("app.run_async")
+    def test_failed_payment_check_is_not_read_as_no_sessions(self, mock_run, client):
+        login(client)
+        mock_run.side_effect = ExceptionGroup("payments", [KeyError("total")])
+        resp = client.get("/cancelled")
+        assert b"couldn&#39;t load your sessions" in resp.data
+        assert b"couldn&#39;t find any paid sessions" not in resp.data
+        with client.session_transaction() as sess:
+            assert "cancelled_events" not in sess
+
+    @patch("app.run_async")
+    def test_target_lookup_failure_shows_retry_message(self, mock_run, client):
+        cancelled = [
+            {"event_id": "EVT1", "label": "STV Swim — Fri 20 Jun", "amount_paid": 350}
+        ]
+        login(client, cancelled_events=cancelled)
+        mock_run.side_effect = ValueError("Request failed with status 503: busy")
+        resp = client.post("/cancelled", data={"cancelled_event": "EVT1"})
+        assert resp.status_code == 200
+        assert b"couldn&#39;t load upcoming sessions" in resp.data
+        assert b"503" not in resp.data
+        assert b"STV Swim" in resp.data
+        with client.session_transaction() as sess:
+            assert "target_events" not in sess
+
 
 class TestStepTarget:
     def test_redirects_without_auth(self, client):
@@ -350,7 +376,7 @@ class TestStepTarget:
             target_events=[{"id": "EVT2", "label": "STV Swim — Mon 23 Jun"}],
         )
         mock_run.side_effect = [
-            ValueError("Payment not found"),  # _do_transfer raises (expected)
+            TransferFailed("Payment not found"),  # _do_transfer raises (expected)
             ([], "Test User"),                # reload in step_cancelled after redirect
         ]
         resp = client.post(
@@ -385,6 +411,28 @@ class TestStepTarget:
         # Generic message, no leak of internals, no false "added" claim.
         assert b"you have not been added" in resp.data
         assert b"kaboom" not in resp.data
+        assert b"Done" not in resp.data
+
+    @patch("app.run_async")
+    def test_spond_library_error_text_is_not_shown(self, mock_run, client):
+        login(
+            client,
+            cancelled_event_id="EVT1",
+            cancelled_event_label="STV Swim — Fri 20 Jun",
+            amount_paid=350,
+            target_events=[{"id": "EVT2", "label": "STV Swim — Mon 23 Jun"}],
+        )
+        mock_run.side_effect = [
+            ValueError("Request failed with status 503: <html>busy</html>"),
+            ([], "Test User"),
+        ]
+        resp = client.post(
+            "/target",
+            data={"target_event": "EVT2"},
+            follow_redirects=True,
+        )
+        assert b"you have not been added" in resp.data
+        assert b"503" not in resp.data
         assert b"Done" not in resp.data
 
 
@@ -638,7 +686,7 @@ class TestImpersonation:
             assert "impersonating" not in sess
 
 
-# --- Transaction matching tests ---
+# --- Session payment tests ---
 
 
 def make_payment(member_id="MEM1", total=350, status="FULFILLED"):
@@ -663,7 +711,6 @@ def mock_spond_for(member, events=None, get_event=None):
 
 
 def payments_by_event(mapping):
-    """Fake _get_session_payments that returns `mapping[event_id]`."""
     return AsyncMock(side_effect=lambda s, event_id: mapping[event_id])
 
 
@@ -827,6 +874,74 @@ class TestFindCancelledPaidEvents:
             await _find_cancelled_paid_events("user@example.com")
         assert exc_info.group_contains(KeyError)
 
+    @pytest.mark.asyncio
+    @patch("app.SESSION_PAYMENTS_CONCURRENCY", 3)
+    @patch("app.Spond")
+    async def test_caps_parallel_payment_fetches(self, MockSpond):
+        import asyncio
+
+        from app import _find_cancelled_paid_events
+
+        events = [
+            make_event(event_id=f"EVT{i}", declined_ids=["MEM1"]) for i in range(10)
+        ]
+        MockSpond.return_value = mock_spond_for(make_person(), events=events)
+        in_flight = 0
+        peak = 0
+
+        async def fetch(s, event_id):
+            nonlocal in_flight, peak
+            in_flight += 1
+            peak = max(peak, in_flight)
+            await asyncio.sleep(0.001)
+            in_flight -= 1
+            return [make_payment()]
+
+        with patch("app._get_session_payments", side_effect=fetch):
+            results, _ = await _find_cancelled_paid_events("user@example.com")
+
+        assert len(results) == 10
+        assert peak == 3
+
+    @pytest.mark.asyncio
+    @patch("app.Spond")
+    async def test_counts_a_guardian_payment_for_a_member_with_no_profile(
+        self, MockSpond
+    ):
+        from app import _find_cancelled_paid_events
+
+        child = make_person()
+        del child["profile"]
+        event = make_event(declined_ids=["MEM1"])
+        MockSpond.return_value = mock_spond_for(child, events=[event])
+        fetch = payments_by_event(
+            {"EVT1": [{**make_payment(), "payerName": "Parent User"}]}
+        )
+
+        with patch("app._get_session_payments", fetch):
+            results, _ = await _find_cancelled_paid_events("user@example.com")
+
+        assert [r["event_id"] for r in results] == ["EVT1"]
+
+
+class TestAmountMemberPaid:
+    @pytest.mark.parametrize(
+        ("payments", "expected"),
+        [
+            (
+                [make_payment(total=350, status="REFUNDED"), make_payment(total=300)],
+                300,
+            ),
+            ([make_payment(status="REFUNDED")], None),
+            ([make_payment("OTHER", total=999), make_payment()], 350),
+        ],
+        ids=["repaid-after-refund", "refunded", "other-member-listed-first"],
+    )
+    def test_amount_member_paid(self, payments, expected):
+        from app import _amount_member_paid
+
+        assert _amount_member_paid(payments, "MEM1") == expected
+
 
 class TestGetMatchingEvents:
     @pytest.mark.asyncio
@@ -987,6 +1102,15 @@ class TestGetSessionPayments:
         with pytest.raises(RuntimeError, match=str(status)):
             await _get_session_payments(s, "EVT1")
 
+    @pytest.mark.asyncio
+    async def test_empty_body_means_no_payments(self):
+        from app import _get_session_payments
+
+        s = self._make_spond()
+        resp = MagicMock(status=200, json=AsyncMock(return_value=None))
+        s.clientsession.get = MagicMock(return_value=MockAsyncContextManager(resp))
+        assert await _get_session_payments(s, "EVT1") == []
+
 
 class TestDoTransfer:
     @pytest.mark.asyncio
@@ -1000,7 +1124,7 @@ class TestDoTransfer:
             make_person(), get_event=[cancelled, target]
         )
 
-        with pytest.raises(ValueError, match="cancelled your spot"):
+        with pytest.raises(TransferFailed, match="cancelled your spot"):
             await _do_transfer("user@example.com", "EVT1", "EVT2")
 
     @pytest.mark.asyncio
@@ -1017,7 +1141,7 @@ class TestDoTransfer:
 
         with (
             patch("app._get_session_payments", fetch),
-            pytest.raises(ValueError, match="prices don't match"),
+            pytest.raises(TransferFailed, match="prices don't match"),
         ):
             await _do_transfer("user@example.com", "EVT1", "EVT2")
 
@@ -1042,7 +1166,7 @@ class TestDoTransfer:
 
         with (
             patch("app._get_session_payments", fetch),
-            pytest.raises(ValueError, match="payment record"),
+            pytest.raises(TransferFailed, match="payment record"),
         ):
             await _do_transfer("user@example.com", "EVT1", "EVT2")
 
@@ -1065,6 +1189,28 @@ class TestDoTransfer:
         assert "acceptedIds" in result
         fetch.assert_awaited_once_with(mock_spond, "EVT1")
         mock_accept.assert_called_once_with(mock_spond, "EVT2", "MEM1")
+
+    @pytest.mark.asyncio
+    @patch("app._accept_without_payment")
+    @patch("app.Spond")
+    async def test_a_failed_payments_fetch_never_adds_the_member(
+        self, MockSpond, mock_accept
+    ):
+        from app import _do_transfer
+
+        cancelled = make_event(event_id="EVT1", payment_total=350, declined_ids=["MEM1"])
+        target = make_event(event_id="EVT2", payment_total=350)
+        MockSpond.return_value = mock_spond_for(
+            make_person(), get_event=[cancelled, target]
+        )
+        fetch = AsyncMock(side_effect=RuntimeError("HTTP 503"))
+
+        with (
+            patch("app._get_session_payments", fetch),
+            pytest.raises(RuntimeError, match="503"),
+        ):
+            await _do_transfer("user@example.com", "EVT1", "EVT2")
+        mock_accept.assert_not_called()
 
 
 class TestAcceptWithoutPayment:
@@ -1118,7 +1264,7 @@ class TestAcceptWithoutPayment:
 
         # e.g. the 402 payment-required response we used to swallow.
         s = self._make_spond(put_status=402, put_body='{"paymentIntent":"pi_x"}')
-        with pytest.raises(ValueError, match="HTTP 402"):
+        with pytest.raises(TransferFailed, match="HTTP 402"):
             await _accept_without_payment(s, "EVT2", "MEM1")
         # Must not even bother verifying — it already failed hard.
         s.clientsession.get.assert_not_called()
@@ -1132,7 +1278,7 @@ class TestAcceptWithoutPayment:
         self._set_fresh_event(
             s, make_event(event_id="EVT2", unanswered_ids=["MEM1"])
         )
-        with pytest.raises(ValueError, match="didn't take effect"):
+        with pytest.raises(TransferFailed, match="didn't take effect"):
             await _accept_without_payment(s, "EVT2", "MEM1")
 
     @pytest.mark.asyncio
@@ -1143,7 +1289,7 @@ class TestAcceptWithoutPayment:
         event = make_event(event_id="EVT2")
         event["responses"]["waitinglistIds"] = ["MEM1"]
         self._set_fresh_event(s, event)
-        with pytest.raises(ValueError, match="waiting list"):
+        with pytest.raises(TransferFailed, match="waiting list"):
             await _accept_without_payment(s, "EVT2", "MEM1")
 
 
