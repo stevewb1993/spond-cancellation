@@ -50,7 +50,7 @@ cp .env.example .env
 | `SPOND_USERNAME` | Your Spond login email |
 | `SPOND_PASSWORD` | Your Spond password |
 | `SPOND_CLUB_ID` | Your club's ID from the Spond Club API |
-| `ADMIN_PASSWORD` | Password for the `/admin` log page |
+| `ADMIN_PASSWORD` | Password for the `/admin` page (admin login is disabled if unset) |
 | `SECRET_KEY` | Flask session secret (use a random string) |
 | `SMTP_HOST` | SMTP server for sending codes (default `smtp.gmail.com`) |
 | `SMTP_PORT` | SMTP port (default `587`, STARTTLS) |

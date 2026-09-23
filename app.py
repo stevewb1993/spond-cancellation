@@ -30,7 +30,7 @@ app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 SPOND_USERNAME = os.environ.get("SPOND_USERNAME", "")
 SPOND_PASSWORD = os.environ.get("SPOND_PASSWORD", "")
 SPOND_CLUB_ID = os.environ.get("SPOND_CLUB_ID", "")
-ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin")
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
 DB_PATH = os.path.join(os.path.dirname(__file__), "transfers.db")
 
 # When DATABASE_URL is set (e.g. a hosted Postgres like Neon) we use Postgres;
@@ -827,7 +827,10 @@ def logout():
 @app.route("/admin", methods=["GET", "POST"])
 def admin():
     if request.method == "POST" and request.form.get("action") == "login":
-        if request.form.get("password") == ADMIN_PASSWORD:
+        password = request.form.get("password", "")
+        if not ADMIN_PASSWORD:
+            flash("Admin login is disabled because ADMIN_PASSWORD is not set.", "error")
+        elif hmac.compare_digest(password.encode(), ADMIN_PASSWORD.encode()):
             session["admin"] = True
             return redirect(url_for("admin"))
         else:
@@ -852,6 +855,10 @@ def admin_impersonate():
     email = request.form.get("member_email", "").strip()
     if not email:
         flash("Please enter the member's email.", "error")
+        return redirect(url_for("admin"))
+
+    if "@" not in email:
+        flash("Please enter the member's email address, not a name or ID.", "error")
         return redirect(url_for("admin"))
 
     try:

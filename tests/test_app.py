@@ -599,6 +599,35 @@ class TestImpersonation:
         resp = client.post("/admin", data={"action": "login", "password": "admin"})
         assert "SameSite=Lax" in resp.headers["Set-Cookie"]
 
+    @patch("app.run_async")
+    def test_rejects_name_or_id(self, mock_run, client):
+        admin_login(client)
+        resp = client.post(
+            "/admin/impersonate",
+            data={"member_email": "Jane Member"},
+            follow_redirects=True,
+        )
+        assert b"not a name or ID" in resp.data
+        mock_run.assert_not_called()
+        with client.session_transaction() as sess:
+            assert "impersonating" not in sess
+
+    @pytest.mark.parametrize("password", ["", "admin"])
+    def test_admin_login_disabled_without_password(self, client, password):
+        with patch("app.ADMIN_PASSWORD", ""):
+            resp = client.post(
+                "/admin", data={"action": "login", "password": password}
+            )
+        assert b"ADMIN_PASSWORD is not set" in resp.data
+        with client.session_transaction() as sess:
+            assert "admin" not in sess
+
+    def test_admin_login_wrong_password(self, client):
+        resp = client.post("/admin", data={"action": "login", "password": "nope"})
+        assert b"Incorrect password" in resp.data
+        with client.session_transaction() as sess:
+            assert "admin" not in sess
+
     def test_no_banner_for_real_member(self, client):
         login(client, cancelled_events=[])
         resp = client.get("/cancelled")
