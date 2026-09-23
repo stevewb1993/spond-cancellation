@@ -14,6 +14,8 @@
         {% endfor %}
         <button type="submit" class="btn btn-primary">Next</button>
     </form>
+    {% elif load_failed %}
+    <p>Your sessions will show here once Spond responds.</p>
     {% else %}
     <p>We couldn't find any paid sessions that you've cancelled. Make sure
        you've declined the session in Spond first, then check back here.</p>

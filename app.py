@@ -6,6 +6,7 @@ import os
 import secrets
 import sqlite3
 import urllib.request
+from contextlib import aclosing
 from functools import wraps
 
 from dotenv import load_dotenv
@@ -30,6 +31,7 @@ app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 SPOND_USERNAME = os.environ.get("SPOND_USERNAME", "")
 SPOND_PASSWORD = os.environ.get("SPOND_PASSWORD", "")
 SPOND_CLUB_ID = os.environ.get("SPOND_CLUB_ID", "")
+TX_DETAIL_CONCURRENCY = 10
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
 DB_PATH = os.path.join(os.path.dirname(__file__), "transfers.db")
 
@@ -225,7 +227,40 @@ async def _get_transaction_detail(http_session, club_token, tx_id):
     }
     url = f"https://api.spond.com/club/v1/transactions/{tx_id}"
     async with http_session.get(url, headers=headers) as r:
+        if r.status == 429 or r.status >= 500:
+            raise RuntimeError(
+                f"Spond transaction {tx_id} detail failed: HTTP {r.status}"
+            )
         return await r.json()
+
+
+async def _iter_member_payments(
+    http_session, club_token, transactions, headings, profile_id
+):
+    """Only the detail says who paid, so this is one request per transaction."""
+    semaphore = asyncio.Semaphore(TX_DETAIL_CONCURRENCY)
+
+    async def fetch(tx):
+        async with semaphore:
+            return await _get_transaction_detail(http_session, club_token, tx["id"])
+
+    tasks = [
+        asyncio.create_task(fetch(tx))
+        for tx in transactions
+        if tx.get("paymentName") in headings
+    ]
+    try:
+        for task in tasks:
+            detail = await task
+            if (
+                detail.get("paidById") == profile_id
+                and detail.get("status") == "FULFILLED"
+            ):
+                yield detail
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 async def _get_event_fresh(s, event_id):
@@ -340,20 +375,15 @@ async def _find_cancelled_paid_events(email):
                 http_session, club_token, min_date, max_date
             )
 
-            # Get details for transactions matching declined event names
-            declined_headings = {e["heading"] for e in declined_events}
-            member_txns = []
-            for tx in transactions:
-                if tx.get("paymentName") not in declined_headings:
-                    continue
-                detail = await _get_transaction_detail(
-                    http_session, club_token, tx["id"]
+            member_txns = [
+                d async for d in _iter_member_payments(
+                    http_session,
+                    club_token,
+                    transactions,
+                    {e["heading"] for e in declined_events},
+                    profile_id,
                 )
-                if (
-                    detail.get("paidById") == profile_id
-                    and detail.get("status") == "FULFILLED"
-                ):
-                    member_txns.append(detail)
+            ]
 
         # Match each transaction to the closest future event with the
         # same name. Each event and transaction can only be used once.
@@ -481,21 +511,21 @@ async def _do_transfer(email, cancelled_event_id, target_event_id):
                 http_session, club_token, min_date, max_date
             )
             amount_paid = None
-            for tx in transactions:
-                if tx.get("paymentName") != cancelled_event["heading"]:
-                    continue
-                detail = await _get_transaction_detail(
-                    http_session, club_token, tx["id"]
+            async with aclosing(
+                _iter_member_payments(
+                    http_session,
+                    club_token,
+                    transactions,
+                    {cancelled_event["heading"]},
+                    profile_id,
                 )
-                if (
-                    detail.get("paidById") == profile_id
-                    and detail.get("status") == "FULFILLED"
-                ):
+            ) as payments:
+                async for d in payments:
                     paid_date = datetime.fromisoformat(
-                        detail["paidAt"].replace("Z", "+00:00")
+                        d["paidAt"].replace("Z", "+00:00")
                     ).date()
                     if paid_date <= event_date:
-                        amount_paid = detail["total"]
+                        amount_paid = d["total"]
                         break
 
         if amount_paid is None:
@@ -728,6 +758,14 @@ def step_cancelled():
             )
         except KeyError:
             cancelled, member_name = [], session.get("member_name", "")
+        except Exception:
+            app.logger.exception("Failed to load cancelled sessions from Spond")
+            flash(
+                "We couldn't load your sessions from Spond right now. "
+                "Please refresh the page in a minute, or contact an admin.",
+                "error",
+            )
+            return render_template("step_cancelled.html", events=[], load_failed=True)
         session["cancelled_events"] = cancelled
         session["member_name"] = member_name
 
