@@ -30,6 +30,7 @@ app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 SPOND_USERNAME = os.environ.get("SPOND_USERNAME", "")
 SPOND_PASSWORD = os.environ.get("SPOND_PASSWORD", "")
 SPOND_CLUB_ID = os.environ.get("SPOND_CLUB_ID", "")
+TX_DETAIL_CONCURRENCY = 10
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
 DB_PATH = os.path.join(os.path.dirname(__file__), "transfers.db")
 
@@ -228,6 +229,25 @@ async def _get_transaction_detail(http_session, club_token, tx_id):
         return await r.json()
 
 
+async def _get_member_payments(http_session, club_token, transactions, profile_id):
+    """Fetch each transaction's detail in parallel and keep, in input order,
+    the fulfilled ones this profile paid.
+
+    Only the detail says who paid, so this is one request per transaction.
+    """
+    semaphore = asyncio.Semaphore(TX_DETAIL_CONCURRENCY)
+
+    async def fetch(tx):
+        async with semaphore:
+            return await _get_transaction_detail(http_session, club_token, tx["id"])
+
+    details = await asyncio.gather(*(fetch(tx) for tx in transactions))
+    return [
+        d for d in details
+        if d.get("paidById") == profile_id and d.get("status") == "FULFILLED"
+    ]
+
+
 async def _get_event_fresh(s, event_id):
     """Fetch a single event straight from the API, bypassing the library cache.
 
@@ -340,20 +360,13 @@ async def _find_cancelled_paid_events(email):
                 http_session, club_token, min_date, max_date
             )
 
-            # Get details for transactions matching declined event names
             declined_headings = {e["heading"] for e in declined_events}
-            member_txns = []
-            for tx in transactions:
-                if tx.get("paymentName") not in declined_headings:
-                    continue
-                detail = await _get_transaction_detail(
-                    http_session, club_token, tx["id"]
-                )
-                if (
-                    detail.get("paidById") == profile_id
-                    and detail.get("status") == "FULFILLED"
-                ):
-                    member_txns.append(detail)
+            member_txns = await _get_member_payments(
+                http_session,
+                club_token,
+                [t for t in transactions if t.get("paymentName") in declined_headings],
+                profile_id,
+            )
 
         # Match each transaction to the closest future event with the
         # same name. Each event and transaction can only be used once.
@@ -480,23 +493,24 @@ async def _do_transfer(email, cancelled_event_id, target_event_id):
             transactions = await _get_transactions_in_range(
                 http_session, club_token, min_date, max_date
             )
-            amount_paid = None
-            for tx in transactions:
-                if tx.get("paymentName") != cancelled_event["heading"]:
-                    continue
-                detail = await _get_transaction_detail(
-                    http_session, club_token, tx["id"]
-                )
-                if (
-                    detail.get("paidById") == profile_id
-                    and detail.get("status") == "FULFILLED"
-                ):
-                    paid_date = datetime.fromisoformat(
-                        detail["paidAt"].replace("Z", "+00:00")
-                    ).date()
-                    if paid_date <= event_date:
-                        amount_paid = detail["total"]
-                        break
+            member_txns = await _get_member_payments(
+                http_session,
+                club_token,
+                [
+                    t for t in transactions
+                    if t.get("paymentName") == cancelled_event["heading"]
+                ],
+                profile_id,
+            )
+        amount_paid = next(
+            (
+                d["total"] for d in member_txns
+                if datetime.fromisoformat(
+                    d["paidAt"].replace("Z", "+00:00")
+                ).date() <= event_date
+            ),
+            None,
+        )
 
         if amount_paid is None:
             raise ValueError(

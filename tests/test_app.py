@@ -1003,6 +1003,52 @@ class TestGetMatchingEvents:
         assert results == []
 
 
+class TestGetMemberPayments:
+    @pytest.mark.asyncio
+    @patch("app.TX_DETAIL_CONCURRENCY", 3)
+    async def test_fetches_in_parallel_with_a_cap_and_keeps_order(self):
+        import asyncio
+
+        from app import _get_member_payments
+
+        details = {
+            "TX0": make_transaction(tx_id="TX0"),
+            "TX1": make_transaction(tx_id="TX1", paid_by_id="OTHER"),
+            "TX2": make_transaction(tx_id="TX2", status="PENDING"),
+            **{
+                f"TX{i}": make_transaction(tx_id=f"TX{i}")
+                for i in range(3, 10)
+            },
+        }
+        in_flight = 0
+        peak = 0
+
+        async def fake_detail(http_session, club_token, tx_id):
+            nonlocal in_flight, peak
+            in_flight += 1
+            peak = max(peak, in_flight)
+            # Finish later requests first, so order must come from the input.
+            await asyncio.sleep(0.001 * (10 - int(tx_id[2:])))
+            in_flight -= 1
+            return details[tx_id]
+
+        with patch("app._get_transaction_detail", side_effect=fake_detail):
+            result = await _get_member_payments(
+                None, "tok", [{"id": tx_id} for tx_id in details], "PROF1"
+            )
+
+        assert [d["id"] for d in result] == ["TX0", *(f"TX{i}" for i in range(3, 10))]
+        assert peak == 3
+
+    @pytest.mark.asyncio
+    async def test_no_transactions(self):
+        from app import _get_member_payments
+
+        with patch("app._get_transaction_detail") as mock_detail:
+            assert await _get_member_payments(None, "tok", [], "PROF1") == []
+        mock_detail.assert_not_called()
+
+
 class TestDoTransfer:
     @pytest.mark.asyncio
     @patch("app.aiohttp.ClientSession")
