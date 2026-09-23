@@ -358,6 +358,17 @@ class TestStepCancelled:
         )
         assert b"no upcoming sessions" in resp.data.lower()
 
+    @patch("app.run_async")
+    def test_spond_failure_shows_retry_message(self, mock_run, client):
+        login(client)
+        mock_run.side_effect = RuntimeError("HTTP 429")
+        resp = client.get("/cancelled")
+        assert resp.status_code == 200
+        assert b"couldn&#39;t load your sessions" in resp.data
+        assert b"429" not in resp.data
+        with client.session_transaction() as sess:
+            assert "cancelled_events" not in sess
+
 
 class TestStepTarget:
     def test_redirects_without_auth(self, client):

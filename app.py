@@ -758,6 +758,14 @@ def step_cancelled():
             )
         except KeyError:
             cancelled, member_name = [], session.get("member_name", "")
+        except Exception:
+            app.logger.exception("Failed to load cancelled sessions from Spond")
+            flash(
+                "We couldn't load your sessions from Spond right now. "
+                "Please refresh the page in a minute, or contact an admin.",
+                "error",
+            )
+            return render_template("step_cancelled.html", events=[], load_failed=True)
         session["cancelled_events"] = cancelled
         session["member_name"] = member_name
 
