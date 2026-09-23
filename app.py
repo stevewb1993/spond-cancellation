@@ -226,22 +226,35 @@ async def _get_transaction_detail(http_session, club_token, tx_id):
     }
     url = f"https://api.spond.com/club/v1/transactions/{tx_id}"
     async with http_session.get(url, headers=headers) as r:
+        if r.status == 429 or r.status >= 500:
+            raise RuntimeError(
+                f"Spond transaction {tx_id} detail failed: HTTP {r.status}"
+            )
         return await r.json()
 
 
-async def _get_member_payments(http_session, club_token, transactions, profile_id):
-    """Fetch each transaction's detail in parallel and keep, in input order,
-    the fulfilled ones this profile paid.
-
-    Only the detail says who paid, so this is one request per transaction.
-    """
+async def _get_member_payments(
+    http_session, club_token, transactions, headings, profile_id
+):
+    """Only the detail says who paid, so this is one request per transaction."""
     semaphore = asyncio.Semaphore(TX_DETAIL_CONCURRENCY)
 
     async def fetch(tx):
         async with semaphore:
             return await _get_transaction_detail(http_session, club_token, tx["id"])
 
-    details = await asyncio.gather(*(fetch(tx) for tx in transactions))
+    tasks = [
+        asyncio.create_task(fetch(tx))
+        for tx in transactions
+        if tx.get("paymentName") in headings
+    ]
+    try:
+        details = await asyncio.gather(*tasks)
+    except BaseException:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
     return [
         d for d in details
         if d.get("paidById") == profile_id and d.get("status") == "FULFILLED"
@@ -360,11 +373,11 @@ async def _find_cancelled_paid_events(email):
                 http_session, club_token, min_date, max_date
             )
 
-            declined_headings = {e["heading"] for e in declined_events}
             member_txns = await _get_member_payments(
                 http_session,
                 club_token,
-                [t for t in transactions if t.get("paymentName") in declined_headings],
+                transactions,
+                {e["heading"] for e in declined_events},
                 profile_id,
             )
 
@@ -496,10 +509,8 @@ async def _do_transfer(email, cancelled_event_id, target_event_id):
             member_txns = await _get_member_payments(
                 http_session,
                 club_token,
-                [
-                    t for t in transactions
-                    if t.get("paymentName") == cancelled_event["heading"]
-                ],
+                transactions,
+                {cancelled_event["heading"]},
                 profile_id,
             )
         amount_paid = next(

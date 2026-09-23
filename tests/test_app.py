@@ -1027,14 +1027,17 @@ class TestGetMemberPayments:
             nonlocal in_flight, peak
             in_flight += 1
             peak = max(peak, in_flight)
-            # Finish later requests first, so order must come from the input.
             await asyncio.sleep(0.001 * (10 - int(tx_id[2:])))
             in_flight -= 1
             return details[tx_id]
 
         with patch("app._get_transaction_detail", side_effect=fake_detail):
             result = await _get_member_payments(
-                None, "tok", [{"id": tx_id} for tx_id in details], "PROF1"
+                None,
+                "tok",
+                [{"id": tx_id, "paymentName": "STV Swim"} for tx_id in details],
+                {"STV Swim"},
+                "PROF1",
             )
 
         assert [d["id"] for d in result] == ["TX0", *(f"TX{i}" for i in range(3, 10))]
@@ -1045,8 +1048,87 @@ class TestGetMemberPayments:
         from app import _get_member_payments
 
         with patch("app._get_transaction_detail") as mock_detail:
-            assert await _get_member_payments(None, "tok", [], "PROF1") == []
+            assert await _get_member_payments(
+                None, "tok", [], {"STV Swim"}, "PROF1"
+            ) == []
         mock_detail.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_only_fetches_transactions_with_a_matching_heading(self):
+        from app import _get_member_payments
+
+        with patch(
+            "app._get_transaction_detail",
+            return_value=make_transaction(tx_id="TX1"),
+        ) as mock_detail:
+            result = await _get_member_payments(
+                None,
+                "tok",
+                [
+                    {"id": "TX1", "paymentName": "STV Swim"},
+                    {"id": "TX2", "paymentName": "Open Water"},
+                    {"id": "TX3"},
+                ],
+                {"STV Swim"},
+                "PROF1",
+            )
+
+        assert [d["id"] for d in result] == ["TX1"]
+        mock_detail.assert_awaited_once_with(None, "tok", "TX1")
+
+    @pytest.mark.asyncio
+    async def test_a_failed_fetch_cancels_the_others_before_raising(self):
+        import asyncio
+
+        from app import _get_member_payments
+
+        cancelled = []
+
+        async def fake_detail(http_session, club_token, tx_id):
+            if tx_id == "TX0":
+                raise RuntimeError("boom")
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                cancelled.append(tx_id)
+                raise
+
+        with (
+            patch("app._get_transaction_detail", side_effect=fake_detail),
+            pytest.raises(RuntimeError, match="boom"),
+        ):
+            await _get_member_payments(
+                None,
+                "tok",
+                [{"id": f"TX{i}", "paymentName": "STV Swim"} for i in range(5)],
+                {"STV Swim"},
+                "PROF1",
+            )
+
+        assert sorted(cancelled) == ["TX1", "TX2", "TX3", "TX4"]
+
+
+class TestGetTransactionDetail:
+    @pytest.mark.asyncio
+    async def test_returns_the_detail(self):
+        from app import _get_transaction_detail
+
+        detail = make_transaction()
+        http = make_mock_http_session(get_responses=[make_mock_response(detail)])
+
+        assert await _get_transaction_detail(http, "tok", "TX1") == detail
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", [429, 500, 503])
+    async def test_raises_when_spond_is_throttling_or_failing(self, status):
+        from app import _get_transaction_detail
+
+        http = make_mock_http_session(
+            get_responses=[make_mock_response({"message": "busy"}, status=status)]
+        )
+
+        with pytest.raises(RuntimeError, match=f"HTTP {status}"):
+            await _get_transaction_detail(http, "tok", "TX1")
 
 
 class TestDoTransfer:
