@@ -7,7 +7,7 @@ A web app that lets triathlon club members transfer a cancelled paid session to 
 1. Member enters their email address
 2. The app checks the email belongs to a club member, then emails a 6-digit verification code to that address
 3. Member enters the code to prove they own the email
-4. The app finds sessions they've cancelled that they previously paid for (via the Spond Club transactions API)
+4. The app finds sessions they've cancelled that they paid for (from each session's own payment list in Spond)
 5. Member selects which cancelled session they want to transfer
 6. The app shows upcoming sessions (next 7 days) at exactly the same price
 7. Member picks a target session and is automatically added to it for free
@@ -26,7 +26,7 @@ All transfers are logged in a local SQLite database and viewable at `/admin`.
 Before a transfer goes through, the app verifies:
 
 - The member has **declined** the cancelled session in Spond
-- A **matching payment** exists in the club's transaction history (matched by payer, event name, date, and `FULFILLED` status)
+- A **`FULFILLED` payment for that exact session** exists on behalf of the member. Spond lists each session's payments, as the organiser web app shows them, so a payment for a different session with the same name never counts
 - The target session costs **exactly the same** as what was paid for the cancelled session
 
 ## Setup
@@ -49,14 +49,12 @@ cp .env.example .env
 |---|---|
 | `SPOND_USERNAME` | Your Spond login email |
 | `SPOND_PASSWORD` | Your Spond password |
-| `SPOND_CLUB_ID` | Your club's ID from the Spond Club API |
 | `ADMIN_PASSWORD` | Password for the `/admin` page (admin login is disabled if unset) |
 | `SECRET_KEY` | Flask session secret (use a random string) |
-| `SMTP_HOST` | SMTP server for sending codes (default `smtp.gmail.com`) |
-| `SMTP_PORT` | SMTP port (default `587`, STARTTLS) |
-| `SMTP_USERNAME` | The sending email account (e.g. `bathamphibiansbookings@gmail.com`) |
-| `SMTP_PASSWORD` | Gmail **App Password** (16 chars, requires 2FA) — not your normal password |
-| `SMTP_FROM` | From address on the emails (defaults to `SMTP_USERNAME`) |
+| `BREVO_API_KEY` | Brevo API key that sends the verification codes |
+| `EMAIL_FROM` | Sender address, verified in Brevo (e.g. `bathamphibiansbookings@gmail.com`) |
+| `EMAIL_FROM_NAME` | Sender name on the emails (default `Bath Amphibians`) |
+| `DATABASE_URL` | Postgres connection string; leave unset to use a local SQLite file |
 
 ### Setting up email (Brevo)
 
@@ -67,20 +65,6 @@ SMTP isn't used because many hosts (including Render) block outbound SMTP ports.
 2. Verify a **sender** address (Senders & IPs → Senders). A Gmail address works
    and needs no DNS changes. Put it in `EMAIL_FROM`.
 3. Create an API key (SMTP & API → API Keys) and put it in `BREVO_API_KEY`.
-
-### Finding your Club ID
-
-Your club ID can be found by logging into the Spond Club API:
-
-```bash
-curl -s -X POST https://api.spond.com/club/v1/login \
-  -H 'Content-Type: application/json' \
-  -d '{"email":"your@email.com","password":"your-password"}' | \
-  python3 -c "import sys,json; token=json.load(sys.stdin)['loginToken']; print(token)" > /tmp/club_token
-
-curl -s https://api.spond.com/club/v1/clubs \
-  -H "Authorization: Bearer $(cat /tmp/club_token)" | python3 -m json.tool
-```
 
 ### Running
 
@@ -110,7 +94,7 @@ Hosted free on **Render** (web service) + **Neon** (Postgres):
    provisions a free web service.
 4. In the Render dashboard, fill in the env vars marked `sync: false` —
    especially `DATABASE_URL` (the Neon string), the `SPOND_*`, `ADMIN_PASSWORD`,
-   and `SMTP_*` values. `SECRET_KEY` is generated automatically.
+   `BREVO_API_KEY` and `EMAIL_FROM` values. `SECRET_KEY` is generated automatically.
 
 The free web service sleeps after ~15 minutes of inactivity and takes ~30–60s to
 wake on the next request — fine for low-traffic use. Neon's free tier is

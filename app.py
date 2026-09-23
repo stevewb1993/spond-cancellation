@@ -6,7 +6,6 @@ import os
 import secrets
 import sqlite3
 import urllib.request
-from contextlib import aclosing
 from functools import wraps
 
 from dotenv import load_dotenv
@@ -20,7 +19,6 @@ from zoneinfo import ZoneInfo
 # switch automatically).
 UK_TZ = ZoneInfo("Europe/London")
 
-import aiohttp
 from flask import Flask, flash, g, redirect, render_template, request, session, url_for
 from spond.spond import Spond
 
@@ -30,8 +28,7 @@ app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 
 SPOND_USERNAME = os.environ.get("SPOND_USERNAME", "")
 SPOND_PASSWORD = os.environ.get("SPOND_PASSWORD", "")
-SPOND_CLUB_ID = os.environ.get("SPOND_CLUB_ID", "")
-TX_DETAIL_CONCURRENCY = 10
+SESSION_PAYMENTS_CONCURRENCY = 10
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
 DB_PATH = os.path.join(os.path.dirname(__file__), "transfers.db")
 
@@ -164,6 +161,10 @@ def get_used_cancelled_event_ids(member_email):
 # --- Spond helpers ---
 
 
+class TransferFailed(Exception):
+    """A transfer failure whose message is safe to show the member."""
+
+
 def run_async(coro):
     loop = asyncio.new_event_loop()
     try:
@@ -185,82 +186,36 @@ def format_event_label(event):
     return name
 
 
-async def _get_club_token(http_session):
-    login_url = "https://api.spond.com/club/v1/login"
-    data = {"email": SPOND_USERNAME, "password": SPOND_PASSWORD}
-    async with http_session.post(login_url, json=data) as r:
-        return (await r.json())["loginToken"]
+async def _get_session_payments(s, event_id):
+    """Payments made for one session, as the Spond organiser web app lists them.
 
-
-async def _get_transactions_in_range(http_session, club_token, min_date, max_date):
-    """Fetch all transactions in a date range."""
-    headers = {
-        "Authorization": f"Bearer {club_token}",
-        "X-Spond-Clubid": SPOND_CLUB_ID,
-    }
-    url = "https://api.spond.com/club/v1/transactions"
-    params = {"minDate": min_date, "maxDate": max_date}
-
-    all_transactions = []
-    skip = 0
-    while True:
-        p = {**params}
-        if skip:
-            p["skip"] = str(skip)
-        async with http_session.get(url, headers=headers, params=p) as r:
-            if r.status != 200:
-                break
-            batch = await r.json()
-        if not batch:
-            break
-        all_transactions.extend(batch)
-        skip += len(batch)
-        if len(batch) < 25:
-            break
-    return all_transactions
-
-
-async def _get_transaction_detail(http_session, club_token, tx_id):
-    headers = {
-        "Authorization": f"Bearer {club_token}",
-        "X-Spond-Clubid": SPOND_CLUB_ID,
-    }
-    url = f"https://api.spond.com/club/v1/transactions/{tx_id}"
-    async with http_session.get(url, headers=headers) as r:
-        if r.status == 429 or r.status >= 500:
+    This core-API endpoint is undocumented; it was found in the web app's
+    network traffic. Each row's ``behalfOfMembershipId`` is the member the
+    payment was for.
+    """
+    if not s.token:
+        await s.login()
+    async with s.clientsession.get(
+        f"{s.api_url}payments/spond",
+        headers=s.auth_headers,
+        params={"spondId": event_id},
+    ) as r:
+        if r.status != 200:
             raise RuntimeError(
-                f"Spond transaction {tx_id} detail failed: HTTP {r.status}"
+                f"Spond payments for session {event_id} failed: HTTP {r.status}"
             )
-        return await r.json()
+        return await r.json() or []
 
 
-async def _iter_member_payments(
-    http_session, club_token, transactions, headings, profile_id
-):
-    """Only the detail says who paid, so this is one request per transaction."""
-    semaphore = asyncio.Semaphore(TX_DETAIL_CONCURRENCY)
-
-    async def fetch(tx):
-        async with semaphore:
-            return await _get_transaction_detail(http_session, club_token, tx["id"])
-
-    tasks = [
-        asyncio.create_task(fetch(tx))
-        for tx in transactions
-        if tx.get("paymentName") in headings
-    ]
-    try:
-        for task in tasks:
-            detail = await task
-            if (
-                detail.get("paidById") == profile_id
-                and detail.get("status") == "FULFILLED"
-            ):
-                yield detail
-    finally:
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+def _amount_member_paid(payments, member_id):
+    return next(
+        (
+            p["total"] for p in payments
+            if p.get("behalfOfMembershipId") == member_id
+            and p.get("status") == "FULFILLED"
+        ),
+        None,
+    )
 
 
 async def _get_event_fresh(s, event_id):
@@ -301,7 +256,7 @@ async def _accept_without_payment(s, event_id, member_id):
         body = await r.text()
         if r.status != 200:
             print(f"[transfer] accept rejected: HTTP {r.status} body={body[:300]}")
-            raise ValueError(
+            raise TransferFailed(
                 f"Spond rejected the transfer (HTTP {r.status}). "
                 "You have not been added. Please contact an admin."
             )
@@ -313,7 +268,7 @@ async def _accept_without_payment(s, event_id, member_id):
     if member_id in responses.get("acceptedIds", []):
         return responses
     if member_id in responses.get("waitinglistIds", []):
-        raise ValueError(
+        raise TransferFailed(
             "That session looks full — you've been put on the waiting list "
             "rather than confirmed. Please contact an admin."
         )
@@ -322,7 +277,7 @@ async def _accept_without_payment(s, event_id, member_id):
         f"[transfer] post-check failed: {member_id} not in acceptedIds for "
         f"{event_id}; response buckets={counts}"
     )
-    raise ValueError(
+    raise TransferFailed(
         "The transfer didn't take effect in Spond — you have not been added. "
         "Please contact an admin."
     )
@@ -337,7 +292,6 @@ async def _find_cancelled_paid_events(email):
     try:
         person = await s.get_person(email)
         member_id = person["id"]
-        profile_id = person["profile"]["id"]
         member_name = f"{person['firstName']} {person['lastName']}"
 
         events = await s.get_events(
@@ -355,78 +309,27 @@ async def _find_cancelled_paid_events(email):
             if member_id not in declined_ids:
                 continue
             declined_events.append(event)
+        declined_events.sort(key=lambda e: e["startTimestamp"])
 
-        if not declined_events:
-            return [], member_name
+        semaphore = asyncio.Semaphore(SESSION_PAYMENTS_CONCURRENCY)
 
-        # Check transactions to find which declined events were paid for
-        earliest_event = min(
-            declined_events, key=lambda e: e["startTimestamp"]
-        )
-        earliest_date = datetime.fromisoformat(
-            earliest_event["startTimestamp"].replace("Z", "+00:00")
-        ).date()
-        min_date = (earliest_date - timedelta(days=30)).isoformat()
-        max_date = datetime.now(timezone.utc).date().isoformat()
+        async def amount_paid_for(event):
+            async with semaphore:
+                payments = await _get_session_payments(s, event["id"])
+            return _amount_member_paid(payments, member_id)
 
-        async with aiohttp.ClientSession() as http_session:
-            club_token = await _get_club_token(http_session)
-            transactions = await _get_transactions_in_range(
-                http_session, club_token, min_date, max_date
-            )
+        async with asyncio.TaskGroup() as tg:
+            tasks = [tg.create_task(amount_paid_for(e)) for e in declined_events]
 
-            member_txns = [
-                d async for d in _iter_member_payments(
-                    http_session,
-                    club_token,
-                    transactions,
-                    {e["heading"] for e in declined_events},
-                    profile_id,
-                )
-            ]
-
-        # Match each transaction to the closest future event with the
-        # same name. Each event and transaction can only be used once.
-        matched_event_ids = set()
-        matched_tx_ids = set()
-        results = []
-
-        for tx in member_txns:
-            if tx["id"] in matched_tx_ids:
-                continue
-            paid_date = datetime.fromisoformat(
-                tx["paidAt"].replace("Z", "+00:00")
-            ).date()
-
-            # Find the closest event after payment with the same name
-            best_event = None
-            best_gap = None
-            for event in declined_events:
-                if event["id"] in matched_event_ids:
-                    continue
-                if event["heading"] != tx["paymentName"]:
-                    continue
-                event_date = datetime.fromisoformat(
-                    event["startTimestamp"].replace("Z", "+00:00")
-                ).date()
-                if paid_date > event_date:
-                    continue
-                gap = (event_date - paid_date).days
-                if best_gap is None or gap < best_gap:
-                    best_event = event
-                    best_gap = gap
-
-            if best_event is not None:
-                matched_event_ids.add(best_event["id"])
-                matched_tx_ids.add(tx["id"])
-                results.append((best_event["startTimestamp"], {
-                    "event_id": best_event["id"],
-                    "label": format_event_label(best_event),
-                    "amount_paid": tx["total"],
-                }))
-
-        results.sort(key=lambda r: r[0])
-        return [r for _, r in results], member_name
+        return [
+            {
+                "event_id": event["id"],
+                "label": format_event_label(event),
+                "amount_paid": amount,
+            }
+            for event, task in zip(declined_events, tasks, strict=True)
+            if (amount := task.result()) is not None
+        ], member_name
     finally:
         await s.clientsession.close()
 
@@ -482,7 +385,6 @@ async def _do_transfer(email, cancelled_event_id, target_event_id):
     try:
         person = await s.get_person(email)
         member_id = person["id"]
-        profile_id = person["profile"]["id"]
 
         cancelled_event = await s.get_event(cancelled_event_id)
         target_event = await s.get_event(target_event_id)
@@ -490,7 +392,7 @@ async def _do_transfer(email, cancelled_event_id, target_event_id):
         # Verify declined
         declined_ids = cancelled_event.get("responses", {}).get("declinedIds", [])
         if member_id not in declined_ids:
-            raise ValueError(
+            raise TransferFailed(
                 "You don't appear to have cancelled your spot on that session. "
                 "Make sure you've declined the session in Spond first."
             )
@@ -498,44 +400,18 @@ async def _do_transfer(email, cancelled_event_id, target_event_id):
         # Verify prices match
         target_price = target_event.get("payment", {}).get("total", 0)
 
-        # Verify payment
-        event_date = datetime.fromisoformat(
-            cancelled_event["startTimestamp"].replace("Z", "+00:00")
-        ).date()
-        min_date = (event_date - timedelta(days=30)).isoformat()
-        max_date = event_date.isoformat()
-
-        async with aiohttp.ClientSession() as http_session:
-            club_token = await _get_club_token(http_session)
-            transactions = await _get_transactions_in_range(
-                http_session, club_token, min_date, max_date
-            )
-            amount_paid = None
-            async with aclosing(
-                _iter_member_payments(
-                    http_session,
-                    club_token,
-                    transactions,
-                    {cancelled_event["heading"]},
-                    profile_id,
-                )
-            ) as payments:
-                async for d in payments:
-                    paid_date = datetime.fromisoformat(
-                        d["paidAt"].replace("Z", "+00:00")
-                    ).date()
-                    if paid_date <= event_date:
-                        amount_paid = d["total"]
-                        break
+        amount_paid = _amount_member_paid(
+            await _get_session_payments(s, cancelled_event_id), member_id
+        )
 
         if amount_paid is None:
-            raise ValueError(
+            raise TransferFailed(
                 "We couldn't find a payment record for that session. "
                 "If you believe this is an error, please contact an admin."
             )
 
         if amount_paid != target_price:
-            raise ValueError(
+            raise TransferFailed(
                 f"The session prices don't match "
                 f"(£{amount_paid / 100:.2f} vs £{target_price / 100:.2f}). "
                 f"You can only transfer to a session that costs exactly the same."
@@ -783,9 +659,18 @@ def step_cancelled():
         if not selected:
             flash("Please select a session.", "error")
         else:
-            target_events = run_async(
-                _get_matching_events(selected["amount_paid"])
-            )
+            try:
+                target_events = run_async(
+                    _get_matching_events(selected["amount_paid"])
+                )
+            except Exception:
+                app.logger.exception("Failed to load target sessions from Spond")
+                flash(
+                    "We couldn't load upcoming sessions from Spond right now. "
+                    "Please try again in a minute, or contact an admin.",
+                    "error",
+                )
+                return render_template("step_cancelled.html", events=cancelled_events)
             # Exclude the cancelled event itself
             target_events = [
                 e for e in target_events if e["id"] != cancelled_id
@@ -845,7 +730,7 @@ def step_target():
                     f"Done! You've been added to {selected['label']}.",
                     "success",
                 )
-            except ValueError as e:
+            except TransferFailed as e:
                 # Expected, user-actionable failures carry a friendly message
                 # (declined check, price mismatch, transfer didn't take, etc.).
                 status = "failed"
