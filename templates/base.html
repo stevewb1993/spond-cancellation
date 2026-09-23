@@ -99,9 +99,28 @@
         .radio-option input { margin-right: 0.5rem; }
         .nav { margin-bottom: 1rem; }
         .nav a { color: #2563eb; text-decoration: none; }
+        .impersonation-banner {
+            position: sticky;
+            top: 0;
+            z-index: 10;
+            background: #fef3c7;
+            color: #92400e;
+            border-bottom: 1px solid #fcd34d;
+            padding: 0.5rem 1rem;
+            font-size: 0.875rem;
+            text-align: center;
+        }
+        .impersonation-banner a { color: #92400e; font-weight: 600; margin-left: 0.5rem; }
     </style>
 </head>
 <body>
+    {% if session.impersonating %}
+    <div class="impersonation-banner">
+        Impersonating <strong>{{ session.member_name or session.email }}</strong>
+        ({{ session.email }}). Transfers are disabled.
+        <a href="{{ url_for('admin_stop_impersonating') }}">Stop impersonating</a>
+    </div>
+    {% endif %}
     <div class="container">
         {% if session.authenticated and session.email %}
         <div class="nav" style="display: flex; justify-content: space-between;">

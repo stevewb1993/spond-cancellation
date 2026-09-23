@@ -19,6 +19,7 @@ All transfers are logged in a local SQLite database and viewable at `/admin`.
 - **Club members only.** The Spond admin account only sees its own club's members, so an email that isn't a club member can't request a code.
 - **Verified email.** A member can only act on the sessions belonging to the email they verified — every step keys off that verified email, and the transfer is re-verified server-side before it goes through.
 - Verification codes expire after 10 minutes and allow 5 attempts before a new code is required.
+- **Admin impersonation.** A logged-in admin can enter a member's email at `/admin` to see the app as that member, with no verification code. A banner stays at the top of each page while this is on. Transfers are disabled while impersonating, so debugging cannot change a member's Spond bookings.
 
 ## Verification
 
@@ -49,7 +50,7 @@ cp .env.example .env
 | `SPOND_USERNAME` | Your Spond login email |
 | `SPOND_PASSWORD` | Your Spond password |
 | `SPOND_CLUB_ID` | Your club's ID from the Spond Club API |
-| `ADMIN_PASSWORD` | Password for the `/admin` log page |
+| `ADMIN_PASSWORD` | Password for the `/admin` page (admin login is disabled if unset) |
 | `SECRET_KEY` | Flask session secret (use a random string) |
 | `SMTP_HOST` | SMTP server for sending codes (default `smtp.gmail.com`) |
 | `SMTP_PORT` | SMTP port (default `587`, STARTTLS) |
@@ -121,4 +122,5 @@ persistent, so the transfer log survives restarts.
 - `/verify` — Enter the emailed code
 - `/cancelled`, `/target` — Multi-step transfer flow (require a verified email)
 - `/logout` — Log out the current member
-- `/admin` — Password-protected transfer log
+- `/admin` — Password-protected transfer log and member impersonation
+- `/admin/stop-impersonating` — End impersonation and go back to `/admin`

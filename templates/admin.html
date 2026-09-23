@@ -5,7 +5,21 @@
     <a href="{{ url_for('admin_logout') }}">Logout</a>
 </div>
 
-<h1>Transfer Log</h1>
+<h1>Admin</h1>
+
+<h2>Impersonate a Member</h2>
+<div class="card">
+    <p>See the app exactly as a member sees it. No verification code is sent.
+       Transfers are disabled while you impersonate.</p>
+    <form method="POST" action="{{ url_for('admin_impersonate') }}">
+        <label for="member_email">Member Email</label>
+        <input type="email" id="member_email" name="member_email" required
+               placeholder="As registered in Spond">
+        <button type="submit" class="btn btn-primary">Impersonate</button>
+    </form>
+</div>
+
+<h2>Transfer Log</h2>
 
 {% if requests %}
 <div class="card">
