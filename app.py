@@ -6,6 +6,7 @@ import os
 import secrets
 import sqlite3
 import urllib.request
+from contextlib import aclosing
 from functools import wraps
 
 from dotenv import load_dotenv
@@ -233,7 +234,7 @@ async def _get_transaction_detail(http_session, club_token, tx_id):
         return await r.json()
 
 
-async def _get_member_payments(
+async def _iter_member_payments(
     http_session, club_token, transactions, headings, profile_id
 ):
     """Only the detail says who paid, so this is one request per transaction."""
@@ -249,16 +250,17 @@ async def _get_member_payments(
         if tx.get("paymentName") in headings
     ]
     try:
-        details = await asyncio.gather(*tasks)
-    except BaseException:
+        for task in tasks:
+            detail = await task
+            if (
+                detail.get("paidById") == profile_id
+                and detail.get("status") == "FULFILLED"
+            ):
+                yield detail
+    finally:
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
-        raise
-    return [
-        d for d in details
-        if d.get("paidById") == profile_id and d.get("status") == "FULFILLED"
-    ]
 
 
 async def _get_event_fresh(s, event_id):
@@ -373,13 +375,15 @@ async def _find_cancelled_paid_events(email):
                 http_session, club_token, min_date, max_date
             )
 
-            member_txns = await _get_member_payments(
-                http_session,
-                club_token,
-                transactions,
-                {e["heading"] for e in declined_events},
-                profile_id,
-            )
+            member_txns = [
+                d async for d in _iter_member_payments(
+                    http_session,
+                    club_token,
+                    transactions,
+                    {e["heading"] for e in declined_events},
+                    profile_id,
+                )
+            ]
 
         # Match each transaction to the closest future event with the
         # same name. Each event and transaction can only be used once.
@@ -506,22 +510,23 @@ async def _do_transfer(email, cancelled_event_id, target_event_id):
             transactions = await _get_transactions_in_range(
                 http_session, club_token, min_date, max_date
             )
-            member_txns = await _get_member_payments(
-                http_session,
-                club_token,
-                transactions,
-                {cancelled_event["heading"]},
-                profile_id,
-            )
-        amount_paid = next(
-            (
-                d["total"] for d in member_txns
-                if datetime.fromisoformat(
-                    d["paidAt"].replace("Z", "+00:00")
-                ).date() <= event_date
-            ),
-            None,
-        )
+            amount_paid = None
+            async with aclosing(
+                _iter_member_payments(
+                    http_session,
+                    club_token,
+                    transactions,
+                    {cancelled_event["heading"]},
+                    profile_id,
+                )
+            ) as payments:
+                async for d in payments:
+                    paid_date = datetime.fromisoformat(
+                        d["paidAt"].replace("Z", "+00:00")
+                    ).date()
+                    if paid_date <= event_date:
+                        amount_paid = d["total"]
+                        break
 
         if amount_paid is None:
             raise ValueError(
